@@ -364,6 +364,57 @@ Otherwise it sends Disconnect `NotAuthenticated`.
 
 The exact URLs will be confirmed when auth is implemented.
 
+### 3.5.1 Spawn sequence
+
+Implemented in `mistvale_core::session`, following gophertunnel's server with
+Dragonfly's values.
+
+| Client sends | Server replies |
+|---|---|
+| ResourcePackClientResponse `resourcepackstackfinished` | JigsawStructureData (313; NBT with empty `processors`, `template_pools`, `jigsaws`, `structure_sets` lists), VoxelShapes (337, empty), StartGame (11), ItemRegistry (162, empty) |
+| RequestChunkRadius (69) | ChunkRadiusUpdated (70, capped at 8), NetworkChunkPublisherUpdate (121: spawn and radius × 16 blocks), every LevelChunk (58) in the circle nearest-first, then on the first request PlayStatus `PlayerSpawn` + CreativeContent (145, empty) |
+| SetLocalPlayerAsInitialized (113) | nothing; the player is in the world |
+| anything else once in the world, e.g. PlayerAuthInput (144) every tick | ignored for now |
+
+- **StartGame** has 81 fields. The encoder was checked line by line against
+  gophertunnel's 2193 marshal. The quirks:
+  - `BlockPos` is three zigzag varints.
+  - UUIDs are two u64 LE halves, the most significant first.
+  - Optionals are a presence bool followed by the value.
+  - `PropertyData` is network NBT.
+  - `PlayerPosition` is the eye position (feet + 1.62).
+- **Values:**
+  - Entity IDs are 1.
+  - Creative mode, peaceful, the flat generator (2), noon.
+  - The `showcoordinates` game rule is on.
+  - Server-authoritative inventory and block breaking, as Dragonfly sends.
+  - `use_block_network_id_hashes = true`.
+- **Block network IDs** are FNV-1a-32 of little-endian NBT `{"name", "states"}`, with
+  states sorted by name and no version field (Dragonfly's `network_block_hash.go`). The
+  client hashes its own states, so no block palette is sent.
+- **LevelChunk:** chunk x/z and dimension as varints; the sub-chunk count as a varuint32
+  (at most 64); an optional sub-chunk limit, absent; a cache bool, false; empty blob
+  hashes; then the payload.
+- **The payload** is:
+  - the sub-chunks, from the bottom up
+  - one biome storage per sub-chunk of the dimension (24 for the overworld), where
+    `0xFF` repeats the previous one
+  - a zero border-block byte
+  - no block entities
+- **Sub-chunks** are `[9][layer count][y index]` followed by paletted layers. Each layer
+  is:
+  - a header of `bits << 1 | 1`
+  - little-endian u32 words, packing `32 / bits` indices LSB-first in x→z→y order
+    (bits ∈ {0, 1, 2, 3, 4, 5, 6, 8, 16})
+  - a palette of zigzag varints; 0-bit layers omit the palette size
+- **Deliberately not sent:**
+  - BiomeDefinitionList. Mojang describes it as the list of *all available biomes*, so
+    an empty one could remove plains, which the chunks use. gophertunnel's minimal
+    server omits it too.
+  - AvailableActorIdentifiers.
+  - Inventories, attributes and entity metadata.
+- The old ItemComponent packet does not exist in 2193; ItemRegistry (162) replaced it.
+
 ### 3.6 Ports and discovery
 
 | Port | Protocol | Use |
@@ -463,8 +514,14 @@ DTLS, SCTP, and multi-segment messages both ways.
   | `packet` | the varuint32 header with sub-client bits; `Packet` / `Encode` / `Decode` traits; IDs checked against Mojang's schemas |
   | `packets` | the handshake packets |
   | `login` | connection-request parsing and unverified identity claims |
+  | `block` | `BlockState` and hashed network IDs |
+  | `chunk` | `PalettedStorage`, `SubChunk` and the LevelChunk payload builder |
+  | `nbt` | encode-only NBT in the network flavor |
+  | `types` | `BlockPos` and `Vec3` |
+  | `packets::spawn` | StartGame and the §3.5.1 packets |
 
-  23 unit tests, including a golden decode of a real client's first message. NBT is not
+  37 unit tests. They include a golden decode of a real client's first message, and FNV-1a
+  checked against the reference vectors plus golden hash-input bytes. NBT decoding is not
   started yet.
 
 ### 4.5 `mistvale_core`
@@ -481,14 +538,21 @@ DTLS, SCTP, and multi-segment messages both ways.
 - **Metrics:** MSPT metrics, and bounded catch-up after tick overruns.
 - **Entities:** an ECS. `bevy_ecs` standalone is the leading candidate; the choice is made
   when implementing core.
-- **Sessions (implemented):** `session::Handshake` is a sans-IO state machine for the §3.5
-  login flow. It returns replies to send, compression to enable afterwards, and whether to
-  close. `session::run` drives it over a NetherNet `Connection`.
-  - Any protocol error ends with a Disconnect **with a message**, so the client shows a
-    reason instead of timing out.
+- **Sessions (implemented):** `session::Session` is a sans-IO state machine for the §3.5
+  login and the §3.5.1 spawn. Its stages are RequestNetworkSettings → Login →
+  ResourcePacks → Spawning → Initializing → InGame. It returns replies to send,
+  compression to enable afterwards, and whether to close. `session::run` drives it over a
+  NetherNet `Connection`.
+  - Before the player is in the world, any protocol error ends with a Disconnect **with a
+    message**, so the client shows a reason instead of timing out.
+  - Once in the world, packets without a handler are ignored.
   - After a Disconnect it waits up to 5 s for the client to hang up.
+- **World (first cut):** `world::FlatWorld` is an endless superflat overworld. It has
+  vanilla's default layers (bedrock at y = -64, two dirt, grass at -61) in plains. Every
+  chunk is identical, so the encoded payload is built once and cloned per LevelChunk. The
+  spawn is (8, -60, 8).
 
-  The tick loop, world and entities are not started yet.
+  The tick loop, real chunk storage, generation and entities are not started yet.
 
 ### 4.6 `mistvale_plugins`
 
@@ -563,11 +627,12 @@ Each step starts only after explicit confirmation.
 | 1 | Workspace, dependencies, four crate skeletons, git | `cargo check --workspace` passes cleanly | ✅ done 2026-09-25 |
 | 2 | `mistvale_net` draft: signaling server, SDP, identity, segmenter/reassembler with tests, str0m peer driver | Compiles, tests pass, and `curl` against `/v1/join` works. A live 26.51 client handshake is the real test and may need iteration. | ✅ done 2026-09-25; a vanilla 1.26.51 client connected over LAN |
 | 3 | `mistvale_plugins` Luau bridge: load `plugins/*.luau` into a sandbox and route `print` to the log | The `plugins/hello.luau` smoke test works | ✅ done 2026-09-25 (prints on boot; hot reload verified live) |
-| 4 | Protocol handshake: batch codec, NetworkSettings → Login → resource packs; ICE-lite so sends only use paths the client proved | A live client gets past RequestNetworkSettings and receives Mistvale's disconnect message | ✅ done 2026-09-25; a vanilla 1.26.51 client over ICE-lite showed the disconnect message |
+| 4 | Protocol handshake: batch codec, NetworkSettings → Login → resource packs; ICE-lite so sends only use paths the client proved | A live client gets past RequestNetworkSettings and receives Mistvale's disconnect message | ✅ done 2026-09-25; a vanilla 1.26.51 client over ICE-lite showed the disconnect message (commit `5aab46c`) |
+| 5 | World spawning: StartGame, empty registries, hashed block IDs, flat chunks, PlayerSpawn → SetLocalPlayerAsInitialized | A live client leaves "Building terrain" and stands on grass | 🧪 ready for a live test (2026-09-25) |
 
 Later steps are proposed but not yet scheduled:
 - player auth (JWKS verification of the multiplayer token)
-- StartGame and the packets that follow it, so a player spawns
+- vanilla item and biome data (ItemRegistry, BiomeDefinitionList, CreativeContent)
 - the core tick loop and world
 - chunk streaming
 - the plugin host API and hot reload
@@ -582,6 +647,10 @@ Later steps are proposed but not yet scheduled:
   ICE-lite, the client completed the step 4 login handshake: compressed batches both ways,
   and Mistvale's Disconnect message was displayed. Still unverified:
   - NAT'd or public deployments using advertised addresses
+- **Minimal registries are untested with a live client.** The spawn sends an empty
+  ItemRegistry and no BiomeDefinitionList, mirroring gophertunnel's minimal server. If
+  the client stalls or crashes, vanilla item and biome data are needed. They would come
+  from a BDS data dump, which is subject to licensing (see below).
 - **str0m's SDP candidate parser is strict.** It expects the `ufrag` extension after
   `network-id`, while libwebrtc (and so our answer) writes it before. It then silently
   drops the candidate. This only affects str0m acting as a client, as in the loopback

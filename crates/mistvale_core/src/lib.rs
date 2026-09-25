@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 pub mod session;
+pub mod world;
 
 /// Simulation rate of the game loop.
 pub const TICKS_PER_SECOND: u32 = 20;

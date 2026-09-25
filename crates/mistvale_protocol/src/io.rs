@@ -183,6 +183,10 @@ impl Writer {
         self.raw(&value.to_le_bytes());
     }
 
+    pub fn i16_le(&mut self, value: i16) {
+        self.raw(&value.to_le_bytes());
+    }
+
     pub fn u32_le(&mut self, value: u32) {
         self.raw(&value.to_le_bytes());
     }
@@ -199,7 +203,15 @@ impl Writer {
         self.raw(&value.to_le_bytes());
     }
 
+    pub fn i64_le(&mut self, value: i64) {
+        self.raw(&value.to_le_bytes());
+    }
+
     pub fn f32_le(&mut self, value: f32) {
+        self.raw(&value.to_le_bytes());
+    }
+
+    pub fn f64_le(&mut self, value: f64) {
         self.raw(&value.to_le_bytes());
     }
 

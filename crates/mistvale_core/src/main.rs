@@ -10,9 +10,11 @@
 
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use mistvale_core::session;
+use mistvale_core::world::FlatWorld;
 use mistvale_net::{Connection, Listener, ListenerConfig, ServerStatus};
 use mistvale_plugins::{PluginConfig, PluginHost};
 use tracing_subscriber::EnvFilter;
@@ -46,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         max_players: 20,
         game_type: 0,
     };
+    let world = Arc::new(FlatWorld::new());
     let mut listener = Listener::bind(listener_config()?, status)
         .await
         .context("failed to start the NetherNet listener")?;
@@ -60,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             connection = listener.accept() => match connection {
                 Some(connection) => {
-                    tokio::spawn(serve(connection));
+                    tokio::spawn(serve(connection, Arc::clone(&world)));
                 }
                 None => break,
             },
@@ -75,14 +78,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Runs a client's protocol session until it disconnects.
-async fn serve(connection: Connection) {
+async fn serve(connection: Connection, world: Arc<FlatWorld>) {
     let network_id = connection.network_id();
     tracing::info!(
         network_id,
         issuer = ?connection.client_identity().map(|identity| &identity.issuer),
         "client connected"
     );
-    session::run(connection).await;
+    session::run(connection, world).await;
     tracing::info!(network_id, "client disconnected");
 }
 

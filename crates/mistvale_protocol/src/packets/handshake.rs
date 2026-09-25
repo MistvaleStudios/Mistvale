@@ -1,7 +1,4 @@
-//! Packets of the login handshake, laid out as in protocol 2193.
-//!
-//! Field layouts follow Mojang's protocol schemas at `v1.26.51`, with
-//! gophertunnel (which targets the same protocol) as a cross-check.
+//! Packets of the login handshake.
 
 use crate::io::{DecodeError, Reader, Writer};
 use crate::packet::{Decode, Encode, Packet, id};

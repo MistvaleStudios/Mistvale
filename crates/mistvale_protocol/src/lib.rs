@@ -6,14 +6,19 @@
 //! transport-agnostic: it consumes and produces the byte messages that
 //! `mistvale_net` carries over NetherNet.
 //!
-//! So far it covers the batch framing ([`batch`]) and the login handshake
-//! ([`packets`], [`login`]).
+//! So far it covers the batch framing ([`batch`]), the login handshake
+//! ([`packets`], [`login`]) and the spawn sequence: StartGame, hashed block
+//! network IDs ([`block`]) and chunk encoding ([`chunk`]). NBT is encode-only.
 
 pub mod batch;
+pub mod block;
+pub mod chunk;
 pub mod io;
 pub mod login;
+pub mod nbt;
 pub mod packet;
 pub mod packets;
+pub mod types;
 
 /// Network protocol version spoken by this build (Bedrock 26.51).
 pub const PROTOCOL_VERSION: i32 = 2193;

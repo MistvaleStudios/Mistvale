@@ -11,9 +11,19 @@ pub mod id {
     pub const RESOURCE_PACK_STACK: u32 = 7;
     pub const RESOURCE_PACK_CLIENT_RESPONSE: u32 = 8;
     pub const START_GAME: u32 = 11;
+    pub const LEVEL_CHUNK: u32 = 58;
+    pub const REQUEST_CHUNK_RADIUS: u32 = 69;
+    pub const CHUNK_RADIUS_UPDATED: u32 = 70;
+    pub const SET_LOCAL_PLAYER_AS_INITIALIZED: u32 = 113;
+    pub const NETWORK_CHUNK_PUBLISHER_UPDATE: u32 = 121;
     pub const CLIENT_CACHE_STATUS: u32 = 129;
     pub const NETWORK_SETTINGS: u32 = 143;
+    pub const PLAYER_AUTH_INPUT: u32 = 144;
+    pub const CREATIVE_CONTENT: u32 = 145;
+    pub const ITEM_REGISTRY: u32 = 162;
     pub const REQUEST_NETWORK_SETTINGS: u32 = 193;
+    pub const JIGSAW_STRUCTURE_DATA: u32 = 313;
+    pub const VOXEL_SHAPES: u32 = 337;
 }
 
 /// A packet's varuint32 header: the packet ID in the low 10 bits, then 2 bits
