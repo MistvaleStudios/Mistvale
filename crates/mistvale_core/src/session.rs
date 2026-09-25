@@ -12,14 +12,17 @@
 //!    VoxelShapes, StartGame and ItemRegistry.
 //! 5. RequestChunkRadius → ChunkRadiusUpdated, NetworkChunkPublisherUpdate, the
 //!    chunks in view, PlayStatus(PlayerSpawn) and CreativeContent.
-//! 6. SetLocalPlayerAsInitialized: the player is in the world.
+//! 6. SetLocalPlayerAsInitialized: the player is in the world. They join the
+//!    [`Players`](crate::players::Players) and plugins hear `player_join`.
+//!
+//! From then on, chat messages (Text) are relayed to every player.
 
-use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use mistvale_net::{ClientIdentity, Connection, Reliability};
+use mistvale_plugins::{Event, Player};
 use mistvale_protocol::batch::{self, BatchError, Compression, CompressionAlgorithm};
 use mistvale_protocol::io::DecodeError;
 use mistvale_protocol::login::{ConnectionRequest, LoginError};
@@ -30,12 +33,16 @@ use mistvale_protocol::packets::{
     EXEMPTED_PACKS, GameRule, GameRuleValue, ItemRegistry, JigsawStructureData, Login,
     NetworkChunkPublisherUpdate, NetworkSettings, PackResponse, PlayStatus, PlayStatusCode,
     PlayerMovementSettings, RequestChunkRadius, RequestNetworkSettings, ResourcePackClientResponse,
-    ResourcePackStack, ResourcePacksInfo, SetLocalPlayerAsInitialized, StackPack, StartGame,
-    VoxelShapes,
+    ResourcePackStack, ResourcePacksInfo, SetLocalPlayerAsInitialized, StackPack, StartGame, Text,
+    TextType, VoxelShapes,
 };
 use mistvale_protocol::types::Vec3;
 use mistvale_protocol::{GAME_VERSION, PROTOCOL_VERSION};
+use tokio::sync::mpsc;
+use uuid::Uuid;
 
+use crate::players::{OUTBOUND_QUEUE, Profile};
+use crate::server::Server;
 use crate::world::{FlatWorld, OVERWORLD};
 
 /// Compression the server asks clients to use.
@@ -57,51 +64,104 @@ const PLAYER_ENTITY_ID: u64 = 1;
 /// Height of a player's eyes above their feet.
 const EYE_HEIGHT: f32 = 1.62;
 
-/// Serves one client until either side closes the connection.
-pub async fn run(mut connection: Connection, world: Arc<FlatWorld>) {
-    let network_id = connection.network_id();
-    let mut session = Session::new(connection.client_identity().cloned(), world);
-    let mut compression = None;
+/// Longest chat message relayed, in characters.
+const MAX_CHAT_LENGTH: usize = 512;
 
-    while let Some(message) = connection.recv().await {
-        let replies = match batch::decode(&message.payload, compression.is_some()) {
-            Ok(packets) => packets
-                .iter()
-                .map(|packet| {
-                    session
-                        .handle(packet)
-                        .unwrap_or_else(|err| err.into_reply())
-                })
-                .collect(),
-            Err(err) => vec![SessionError::from(err).into_reply()],
-        };
-        for reply in replies {
-            if !reply.packets.is_empty() {
-                let packets = reply.packets.iter().map(Vec::as_slice);
-                let sent = match batch::encode(packets, compression) {
-                    Ok(batch) => connection
-                        .send(Bytes::from(batch), Reliability::Reliable)
-                        .await
-                        .is_ok(),
-                    Err(err) => {
-                        tracing::warn!(network_id, %err, "failed to encode a batch");
-                        false
-                    }
+/// Serves one client until either side closes the connection.
+pub async fn run(mut connection: Connection, server: Arc<Server>) {
+    let network_id = connection.network_id();
+    let mut session = Session::new(
+        connection.client_identity().cloned(),
+        Arc::clone(&server.world),
+    );
+    let mut compression = None;
+    // Packets other sessions and plugins send this player, e.g. chat.
+    let (outbound, mut queued) = mpsc::channel::<Bytes>(OUTBOUND_QUEUE);
+    // Set once the player is in the world; leaving the loop drops it.
+    let mut membership = None;
+
+    loop {
+        tokio::select! {
+            message = connection.recv() => {
+                let Some(message) = message else {
+                    tracing::debug!(network_id, "client closed the connection");
+                    return;
                 };
-                if !sent {
+                let replies = match batch::decode(&message.payload, compression.is_some()) {
+                    Ok(packets) => packets
+                        .iter()
+                        .map(|packet| {
+                            session
+                                .handle(packet)
+                                .unwrap_or_else(|err| err.into_reply())
+                        })
+                        .collect(),
+                    Err(err) => vec![SessionError::from(err).into_reply()],
+                };
+                for reply in replies {
+                    let packets = reply.packets.iter().map(Vec::as_slice);
+                    if !send(&connection, packets, compression).await {
+                        return;
+                    }
+                    if let Some(agreed) = reply.enable_compression {
+                        compression = Some(agreed);
+                    }
+                    for event in reply.events {
+                        match event {
+                            SessionEvent::Joined(profile) => {
+                                let player = Player {
+                                    name: profile.name.clone(),
+                                    uuid: profile.uuid.to_string(),
+                                };
+                                // Join first, so plugins greeting the player reach them too.
+                                membership = Some(server.players.join(profile, outbound.clone()));
+                                server.plugins.dispatch(Event::PlayerJoin(player));
+                            }
+                            SessionEvent::Chat(message) => {
+                                server.players.chat(session.player(), &message);
+                            }
+                        }
+                    }
+                    if reply.close {
+                        drop(membership.take());
+                        linger(&mut connection).await;
+                        return;
+                    }
+                }
+            }
+            Some(packet) = queued.recv() => {
+                // Send everything already waiting in one batch.
+                let mut packets = vec![packet];
+                while let Ok(packet) = queued.try_recv() {
+                    packets.push(packet);
+                }
+                if !send(&connection, packets.iter().map(|packet| &packet[..]), compression).await {
                     return;
                 }
             }
-            if let Some(agreed) = reply.enable_compression {
-                compression = Some(agreed);
-            }
-            if reply.close {
-                linger(&mut connection).await;
-                return;
-            }
         }
     }
-    tracing::debug!(network_id, "client closed the connection");
+}
+
+/// Sends packets as one reliable batch. Returns whether the connection is still usable.
+async fn send<'a>(
+    connection: &Connection,
+    packets: impl ExactSizeIterator<Item = &'a [u8]>,
+    compression: Option<Compression>,
+) -> bool {
+    if packets.len() == 0 {
+        return true;
+    }
+    match batch::encode(packets, compression) {
+        Ok(batch) => connection
+            .send(Bytes::from(batch), Reliability::Reliable)
+            .await
+            .is_ok(),
+        Err(err) => {
+            tracing::warn!(network_id = connection.network_id(), %err, "failed to encode a batch");
+            false
+        }
+    }
 }
 
 /// Gives the client time to read our last packets and hang up by itself.
@@ -121,6 +181,17 @@ pub struct Reply {
     pub enable_compression: Option<Compression>,
     /// Close the connection once `packets` has been sent.
     pub close: bool,
+    /// What the rest of the server should hear about, once `packets` has been sent.
+    pub events: Vec<SessionEvent>,
+}
+
+/// Something a session did that matters beyond its own client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEvent {
+    /// The player finished spawning and is in the world.
+    Joined(Profile),
+    /// The player said something in chat.
+    Chat(String),
 }
 
 impl Reply {
@@ -199,8 +270,10 @@ pub struct Session {
     stage: Stage,
     /// The identity the client proved during NetherNet signaling, if any.
     identity: Option<ClientIdentity>,
-    /// The name the player logged in with, for logs.
+    /// The name the player logged in with.
     player: String,
+    /// The player's persistent identity, known after login.
+    uuid: Uuid,
     world: Arc<FlatWorld>,
 }
 
@@ -210,12 +283,18 @@ impl Session {
             stage: Stage::RequestNetworkSettings,
             identity,
             player: String::from("<unknown>"),
+            uuid: Uuid::nil(),
             world,
         }
     }
 
     pub fn stage(&self) -> Stage {
         self.stage
+    }
+
+    /// The player's name, once logged in.
+    pub fn player(&self) -> &str {
+        &self.player
     }
 
     /// Handles one encoded packet (header and payload).
@@ -237,6 +316,7 @@ impl Session {
             (Stage::Initializing | Stage::InGame, id::SET_LOCAL_PLAYER_AS_INITIALIZED) => {
                 Ok(self.initialized(packet::decode(payload)?))
             }
+            (Stage::InGame, id::TEXT) => Ok(self.text(packet::decode(payload)?)),
             (stage, id) if stage.in_world() => {
                 if id != id::PLAYER_AUTH_INPUT {
                     tracing::trace!(id, "ignoring packet without a handler");
@@ -280,7 +360,7 @@ impl Session {
         Ok(Reply {
             packets: vec![settings.encode()],
             enable_compression: Some(COMPRESSION),
-            close: false,
+            ..Reply::default()
         })
     }
 
@@ -309,9 +389,13 @@ impl Session {
             }
         }
 
+        self.uuid = claims.identity.unwrap_or_else(|| {
+            tracing::debug!("login has no persistent identity; using a random UUID");
+            Uuid::new_v4()
+        });
         tracing::info!(
             name = ?claims.display_name,
-            xuid = ?claims.xuid,
+            uuid = %self.uuid,
             "player logged in (identity not verified yet)"
         );
         if let Some(name) = claims.display_name {
@@ -418,11 +502,47 @@ impl Session {
                 "client initialized an unexpected entity"
             );
         }
-        if self.stage != Stage::InGame {
-            self.stage = Stage::InGame;
-            tracing::info!(player = %self.player, "player spawned in the world");
+        if self.stage == Stage::InGame {
+            return Reply::default();
         }
-        Reply::default()
+        self.stage = Stage::InGame;
+        tracing::info!(player = %self.player, "player spawned in the world");
+        Reply {
+            events: vec![SessionEvent::Joined(Profile {
+                name: self.player.clone(),
+                uuid: self.uuid,
+            })],
+            ..Reply::default()
+        }
+    }
+
+    /// Relays the player's chat messages; clients send no other kind of text.
+    fn text(&mut self, text: Text) -> Reply {
+        if text.text_type != TextType::Chat {
+            tracing::debug!(player = %self.player, text_type = ?text.text_type, "ignoring text that is not chat");
+            return Reply::default();
+        }
+        // Line breaks and other control characters would let a player fake
+        // extra lines, such as a message from someone else.
+        let message: String = text
+            .message
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let message = message.trim();
+        if message.is_empty() {
+            return Reply::default();
+        }
+        if message.chars().count() > MAX_CHAT_LENGTH {
+            let warning =
+                format!("§cChat messages can be at most {MAX_CHAT_LENGTH} characters long.");
+            return Reply::send(vec![Text::raw(warning).encode()]);
+        }
+        tracing::info!(target: "chat", "<{}> {message}", self.player);
+        Reply {
+            events: vec![SessionEvent::Chat(message.to_owned())],
+            ..Reply::default()
+        }
     }
 }
 
@@ -508,7 +628,7 @@ fn start_game(world: &FlatWorld) -> StartGame {
         time: 6000,
         enchantment_seed: 0,
         blocks: Vec::new(),
-        multiplayer_correlation_id: random_uuid(),
+        multiplayer_correlation_id: Uuid::new_v4().to_string(),
         server_authoritative_inventory: true,
         game_version: GAME_VERSION.into(),
         property_data: Compound::new(),
@@ -522,20 +642,6 @@ fn start_game(world: &FlatWorld) -> StartGame {
         world_id: String::new(),
         owner_id: String::new(),
     }
-}
-
-/// A random UUID string, from std's randomly seeded hasher.
-fn random_uuid() -> String {
-    let state = RandomState::new();
-    let (high, low) = (state.hash_one(0u8), state.hash_one(1u8));
-    format!(
-        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
-        high >> 32,
-        (high >> 16) & 0xFFFF,
-        high & 0x0FFF,
-        ((low >> 48) & 0x3FFF) | 0x8000,
-        low & 0xFFFF_FFFF_FFFF
-    )
 }
 
 #[cfg(test)]
@@ -785,10 +891,95 @@ mod tests {
     }
 
     #[test]
-    fn random_uuids_are_well_formed() {
-        let uuid = random_uuid();
-        assert_eq!(uuid.len(), 36);
-        assert_eq!(uuid.as_bytes()[14], b'4');
-        assert!(matches!(uuid.as_bytes()[19], b'8' | b'9' | b'a' | b'b'));
+    fn joins_once_initialized_then_relays_chat() {
+        let mut session = spawning_session();
+        let request = RequestChunkRadius {
+            radius: 2,
+            max_radius: 32,
+        };
+        session.handle(&request.encode()).unwrap();
+
+        // Chat before spawning finishes is ignored.
+        let chat = |message: &str| Text {
+            text_type: TextType::Chat,
+            source_name: "Spoofed".into(),
+            ..Text::raw(message)
+        };
+        assert_eq!(
+            session.handle(&chat("too early").encode()).unwrap().events,
+            []
+        );
+
+        let initialized = SetLocalPlayerAsInitialized {
+            entity_runtime_id: PLAYER_ENTITY_ID,
+        };
+        let reply = session.handle(&initialized.encode()).unwrap();
+        let [SessionEvent::Joined(profile)] = &reply.events[..] else {
+            panic!("expected a join, got {:?}", reply.events);
+        };
+        assert_eq!(profile.name, session.player());
+        assert!(!profile.uuid.is_nil());
+        // Initializing again does not join twice.
+        assert!(
+            session
+                .handle(&initialized.encode())
+                .unwrap()
+                .events
+                .is_empty()
+        );
+
+        // The author comes from the session, never the packet; control
+        // characters cannot start a fake line.
+        let reply = session
+            .handle(&chat("  hi\n<Admin> op me ").encode())
+            .unwrap();
+        assert_eq!(
+            reply.events,
+            [SessionEvent::Chat("hi <Admin> op me".into())]
+        );
+        assert!(reply.packets.is_empty());
+    }
+
+    #[test]
+    fn rejects_overlong_chat_with_a_warning() {
+        let mut session = spawning_session();
+        session
+            .handle(
+                &RequestChunkRadius {
+                    radius: 1,
+                    max_radius: 1,
+                }
+                .encode(),
+            )
+            .unwrap();
+        session
+            .handle(
+                &SetLocalPlayerAsInitialized {
+                    entity_runtime_id: PLAYER_ENTITY_ID,
+                }
+                .encode(),
+            )
+            .unwrap();
+
+        let long = Text {
+            text_type: TextType::Chat,
+            ..Text::raw("a".repeat(MAX_CHAT_LENGTH + 1))
+        };
+        let reply = session.handle(&long.encode()).unwrap();
+        assert!(reply.events.is_empty());
+        let warning: Text = decode_only(&reply.packets[0]);
+        assert!(
+            warning.message.contains("at most 512"),
+            "{}",
+            warning.message
+        );
+
+        // Other text types from a client are ignored.
+        let tip = Text {
+            text_type: TextType::Tip,
+            ..Text::raw("hi")
+        };
+        let reply = session.handle(&tip.encode()).unwrap();
+        assert!(reply.events.is_empty() && reply.packets.is_empty());
     }
 }

@@ -8,7 +8,9 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD_INDIFFERENT;
+use md5::{Digest as _, Md5};
 use serde_json::{Value, json};
+use uuid::{Builder, Uuid};
 
 use crate::io::{DecodeError, Reader, Writer};
 
@@ -40,6 +42,9 @@ pub struct ConnectionRequest {
 pub struct IdentityClaims {
     pub xuid: Option<String>,
     pub display_name: Option<String>,
+    /// The player's persistent UUID, which stays the same across sessions and
+    /// name changes. Derived as vanilla does; see [`identity_from_xuid`].
+    pub identity: Option<Uuid>,
     /// The player's public key: a base64 SPKI DER string or a JWK object.
     pub public_key: Option<Value>,
 }
@@ -109,9 +114,14 @@ impl ConnectionRequest {
     pub fn identity(&self) -> Result<IdentityClaims, LoginError> {
         if !self.token.is_empty() {
             let claims = jwt_claims(&self.token)?;
+            let xuid = text_claim(&claims, "xid");
+            // Offline logins carry their UUID; otherwise it comes from the XUID.
+            let identity =
+                uuid_claim(&claims, "leguuid").or_else(|| xuid.as_deref().map(identity_from_xuid));
             return Ok(IdentityClaims {
-                xuid: text_claim(&claims, "xid"),
+                xuid,
                 display_name: text_claim(&claims, "xname"),
+                identity,
                 public_key: claims.get("cpk").cloned(),
             });
         }
@@ -124,9 +134,20 @@ impl ConnectionRequest {
         Ok(IdentityClaims {
             xuid: text_claim(extra, "XUID"),
             display_name: text_claim(extra, "displayName"),
+            identity: uuid_claim(extra, "identity"),
             public_key: claims.get("identityPublicKey").cloned(),
         })
     }
+}
+
+/// The UUID vanilla gives the player with this XUID: the MD5 (version 3) UUID
+/// of `pocket-auth-1-xuid:` followed by the XUID, as gophertunnel derives it.
+pub fn identity_from_xuid(xuid: &str) -> Uuid {
+    let digest = Md5::new()
+        .chain_update(b"pocket-auth-1-xuid:")
+        .chain_update(xuid.as_bytes())
+        .finalize();
+    Builder::from_md5_bytes(digest.into()).into_uuid()
 }
 
 /// Decodes a JWT's claims without checking its signature.
@@ -149,6 +170,10 @@ fn text_claim(claims: &Value, name: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn uuid_claim(claims: &Value, name: &str) -> Option<Uuid> {
+    text_claim(claims, name).and_then(|value| Uuid::parse_str(&value).ok())
 }
 
 fn len_u32(len: usize) -> u32 {
@@ -212,8 +237,38 @@ mod tests {
             IdentityClaims {
                 xuid: Some("2535400000000000".into()),
                 display_name: Some("Steve".into()),
+                identity: Some(identity_from_xuid("2535400000000000")),
                 public_key: Some(json!("MHYw")),
             }
+        );
+    }
+
+    #[test]
+    fn identity_uuids_derive_from_the_xuid_like_vanilla() {
+        // MD5 of "pocket-auth-1-xuid:2535400000000000" with the version 3 and
+        // RFC 4122 variant bits set, computed independently with .NET's MD5.
+        assert_eq!(
+            identity_from_xuid("2535400000000000").to_string(),
+            "174319cc-f69f-30d8-a279-6ace57f2011e"
+        );
+    }
+
+    #[test]
+    fn offline_tokens_carry_their_own_identity() {
+        let request = ConnectionRequest {
+            authentication_type: 0,
+            chain: Vec::new(),
+            token: unsigned_jwt(json!({
+                "xname": "Guest",
+                "leguuid": "01234567-89ab-4cde-8f01-23456789abcd"
+            })),
+            client_data: String::new(),
+        };
+        let claims = request.identity().unwrap();
+        assert_eq!(claims.xuid, None);
+        assert_eq!(
+            claims.identity.map(|uuid| uuid.to_string()).as_deref(),
+            Some("01234567-89ab-4cde-8f01-23456789abcd")
         );
     }
 
@@ -223,7 +278,11 @@ mod tests {
             authentication_type: 0,
             chain: vec![unsigned_jwt(json!({
                 "identityPublicKey": "MHYw",
-                "extraData": { "XUID": "", "displayName": "Alex" }
+                "extraData": {
+                    "XUID": "",
+                    "displayName": "Alex",
+                    "identity": "01234567-89ab-4cde-8f01-23456789abcd"
+                }
             }))],
             token: String::new(),
             client_data: String::new(),
@@ -233,6 +292,7 @@ mod tests {
             IdentityClaims {
                 xuid: None,
                 display_name: Some("Alex".into()),
+                identity: Uuid::parse_str("01234567-89ab-4cde-8f01-23456789abcd").ok(),
                 public_key: Some(json!("MHYw")),
             }
         );

@@ -6,12 +6,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
+use tokio::sync::mpsc as tokio_mpsc;
 
 use crate::luau::{Limits, LuauEngine};
-use crate::{Output, tracing_output};
+use crate::{Action, Event, Output, tracing_output};
 
 /// Quiet period after the last change to a file before it is reloaded; editors
 /// often save in several steps.
@@ -59,8 +60,10 @@ pub enum PluginError {
     Startup,
 }
 
+#[derive(Debug)]
 enum Command {
     Changed(PathBuf),
+    Event(Event),
     Shutdown,
 }
 
@@ -74,15 +77,37 @@ pub struct PluginHost {
     loaded: Vec<String>,
 }
 
+/// Delivers game events to the plugins. Cheap to clone and usable from any
+/// thread; events sent after the host has stopped are dropped.
+#[derive(Debug, Clone)]
+pub struct Dispatcher {
+    commands: mpsc::Sender<Command>,
+}
+
+impl Dispatcher {
+    /// Queues `event` for every plugin listening for it.
+    pub fn dispatch(&self, event: Event) {
+        let _ = self.commands.send(Command::Event(event));
+    }
+}
+
 impl PluginHost {
     /// Loads every plugin in the configured directory, logging their output
     /// through `tracing`, and returns once the initial load has finished.
-    pub fn start(config: PluginConfig) -> Result<Self, PluginError> {
-        Self::with_output(config, tracing_output())
+    /// What plugins ask of the server arrives on `actions`.
+    pub fn start(
+        config: PluginConfig,
+        actions: tokio_mpsc::Sender<Action>,
+    ) -> Result<Self, PluginError> {
+        Self::with_output(config, tracing_output(), actions)
     }
 
     /// Like [`PluginHost::start`], sending plugin output to `output`.
-    pub fn with_output(config: PluginConfig, output: Output) -> Result<Self, PluginError> {
+    pub fn with_output(
+        config: PluginConfig,
+        output: Output,
+        actions: tokio_mpsc::Sender<Action>,
+    ) -> Result<Self, PluginError> {
         fs::create_dir_all(&config.directory).map_err(|source| PluginError::Directory {
             path: config.directory.clone(),
             source,
@@ -99,7 +124,7 @@ impl PluginHost {
         let (ready, started) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("luau-plugins".into())
-            .spawn(move || run(config, output, receiver, ready))
+            .spawn(move || run(config, output, actions, receiver, ready))
             .map_err(PluginError::Thread)?;
         let loaded = started.recv().map_err(|_| PluginError::Startup)?;
 
@@ -115,6 +140,13 @@ impl PluginHost {
     pub fn loaded(&self) -> &[String] {
         &self.loaded
     }
+
+    /// A handle for sending game events to the plugins.
+    pub fn dispatcher(&self) -> Dispatcher {
+        Dispatcher {
+            commands: self.commands.clone(),
+        }
+    }
 }
 
 impl Drop for PluginHost {
@@ -126,10 +158,12 @@ impl Drop for PluginHost {
     }
 }
 
-/// The engine thread: loads everything once, then applies debounced file changes.
+/// The engine thread: loads everything once, then delivers events and applies
+/// debounced file changes.
 fn run(
     config: PluginConfig,
     output: Output,
+    actions: tokio_mpsc::Sender<Action>,
     commands: mpsc::Receiver<Command>,
     ready: mpsc::SyncSender<Vec<String>>,
 ) {
@@ -137,35 +171,39 @@ fn run(
         memory: config.memory_limit,
         execution: config.execution_limit,
     };
-    let mut engine = LuauEngine::new(limits, output);
+    let mut engine = LuauEngine::new(limits, output, actions);
     for path in plugin_files(&config.directory) {
         load(&mut engine, &path);
     }
     let _ = ready.send(engine.names());
 
     let mut changed: BTreeSet<PathBuf> = BTreeSet::new();
+    // When to reload `changed`; each change pushes it back, events do not.
+    let mut reload_at: Option<Instant> = None;
     loop {
-        let command = if changed.is_empty() {
-            commands.recv().ok()
-        } else {
-            match commands.recv_timeout(RELOAD_DEBOUNCE) {
+        let command = match reload_at {
+            None => commands.recv().ok(),
+            Some(at) => match commands.recv_timeout(at.saturating_duration_since(Instant::now())) {
                 Ok(command) => Some(command),
                 Err(RecvTimeoutError::Timeout) => {
                     for path in std::mem::take(&mut changed) {
                         sync(&mut engine, &path);
                     }
+                    reload_at = None;
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => None,
-            }
+            },
         };
         match command {
             // Watcher paths may be absolute; name files relative to the configured directory.
             Some(Command::Changed(path)) => {
                 if let Some(file_name) = path.file_name() {
                     changed.insert(config.directory.join(file_name));
+                    reload_at = Some(Instant::now() + RELOAD_DEBOUNCE);
                 }
             }
+            Some(Command::Event(event)) => engine.dispatch(&event),
             Some(Command::Shutdown) | None => break,
         }
     }
@@ -239,7 +277,7 @@ fn watch(
         source,
     };
     let mut watcher =
-        notify::recommended_watcher(move |event: notify::Result<Event>| match event {
+        notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
             Ok(event) => {
                 if matches!(
                     event.kind,
@@ -285,7 +323,8 @@ mod tests {
             directory: directory.clone(),
             ..PluginConfig::default()
         };
-        let host = PluginHost::with_output(config, output).unwrap();
+        let (actions, _) = tokio_mpsc::channel(1);
+        let host = PluginHost::with_output(config, output, actions).unwrap();
         assert_eq!(host.loaded(), ["greet"]);
         assert_eq!(*messages.lock().unwrap(), ["greet: v1"]);
 
@@ -295,6 +334,44 @@ mod tests {
             assert!(Instant::now() < deadline, "plugin was not reloaded");
             thread::sleep(Duration::from_millis(20));
         }
+
+        drop(host);
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn events_reach_plugins_and_their_actions_reach_the_server() {
+        let directory =
+            std::env::temp_dir().join(format!("mistvale-events-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("welcome.luau"),
+            r#"server.on("player_join", function(player) server.broadcast("hi " .. player.name) end)"#,
+        )
+        .unwrap();
+
+        let config = PluginConfig {
+            directory: directory.clone(),
+            hot_reload: false,
+            ..PluginConfig::default()
+        };
+        let (actions, mut received) = tokio_mpsc::channel(4);
+        let host = PluginHost::with_output(config, Arc::new(|_, _, _| {}), actions).unwrap();
+        host.dispatcher().dispatch(Event::PlayerJoin(crate::Player {
+            name: "Steve".into(),
+            uuid: "174319cc-f69f-30d8-a279-6ace57f2011e".into(),
+        }));
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let action = loop {
+            if let Ok(action) = received.try_recv() {
+                break action;
+            }
+            assert!(Instant::now() < deadline, "the plugin did not broadcast");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(action, Action::Broadcast("hi Steve".into()));
 
         drop(host);
         fs::remove_dir_all(&directory).unwrap();

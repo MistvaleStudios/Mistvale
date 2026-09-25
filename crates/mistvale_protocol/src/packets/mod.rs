@@ -5,6 +5,8 @@
 
 mod handshake;
 mod spawn;
+mod text;
 
 pub use handshake::*;
 pub use spawn::*;
+pub use text::*;

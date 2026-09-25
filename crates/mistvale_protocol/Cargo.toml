@@ -10,11 +10,13 @@ publish.workspace = true
 base64.workspace = true
 bytes.workspace = true
 flate2.workspace = true
+md-5.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 snap.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

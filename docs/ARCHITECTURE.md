@@ -513,14 +513,15 @@ DTLS, SCTP, and multi-segment messages both ways.
   | `batch` | framing; raw DEFLATE / Snappy / none; a 16 MiB decompression cap and 812 packets per batch |
   | `packet` | the varuint32 header with sub-client bits; `Packet` / `Encode` / `Decode` traits; IDs checked against Mojang's schemas |
   | `packets` | the handshake packets |
-  | `login` | connection-request parsing and unverified identity claims |
+  | `login` | connection-request parsing and unverified identity claims, including the persistent UUID: the token's `leguuid`, otherwise vanilla's MD5 (v3) UUID of `pocket-auth-1-xuid:` + XUID; the legacy chain's `extraData.identity` |
   | `block` | `BlockState` and hashed network IDs |
   | `chunk` | `PalettedStorage`, `SubChunk` and the LevelChunk payload builder |
   | `nbt` | encode-only NBT in the network flavor |
   | `types` | `BlockPos` and `Vec3` |
   | `packets::spawn` | StartGame and the §3.5.1 packets |
+  | `packets::text` | Text (ID 9): `[bool translate][varuint32 body variant][u8 type]`, then author (chat, whisper, announcement), message (1..=65536 bytes), parameters (translate, popups; ≤ 4), XUID, platform chat ID, optional filtered message. The variant must match the type. |
 
-  37 unit tests. They include a golden decode of a real client's first message, and FNV-1a
+  43 unit tests. They include a golden decode of a real client's first message, and FNV-1a
   checked against the reference vectors plus golden hash-input bytes. NBT decoding is not
   started yet.
 
@@ -547,6 +548,20 @@ DTLS, SCTP, and multi-segment messages both ways.
     message**, so the client shows a reason instead of timing out.
   - Once in the world, packets without a handler are ignored.
   - After a Disconnect it waits up to 5 s for the client to hang up.
+  - Replies also carry `SessionEvent`s for the rest of the server: `Joined(Profile)` on
+    the first SetLocalPlayerAsInitialized, and `Chat(message)`.
+- **Players and chat (implemented):** `server::Server` holds the world, the
+  `players::Players` registry and the plugin `Dispatcher`. Each session has a bounded
+  queue (256 packets) that `run` drains alongside the connection, batching whatever is
+  waiting. On `Joined` the player is registered first, then plugins get `player_join`, so
+  a greeting reaches the new player too. A `Membership` guard removes the player on any
+  exit.
+  - Chat: only `TextType::Chat` is accepted, and only in game. The author is always the
+    session's player; the packet's source name and XUID are ignored. Control characters
+    become spaces, so nobody can fake a second line. Messages over 512 characters are
+    refused with a warning to the sender. Everything else goes to everyone as Raw text
+    `<name> message`, as Dragonfly does, so no player list is needed.
+  - A full player queue drops that player's packet rather than stalling the others.
 - **World (first cut):** `world::FlatWorld` is an endless superflat overworld. It has
   vanilla's default layers (bedrock at y = -64, two dirt, grass at -61) in plains. Every
   chunk is identical, so the encoded payload is built once and cloned per LevelChunk. The
@@ -560,8 +575,21 @@ DTLS, SCTP, and multi-segment messages both ways.
   one isolated VM per plugin. Luau's thread is named `luau-plugins`. A `ScriptEngine`
   trait will be extracted when the second engine arrives, so its shape comes from real
   needs.
-- **Messaging only:** game → plugins for events, plugins → game for commands. Plugins have
-  no direct access to the world. The event and command API is not built yet.
+- **Messaging only (implemented):** game → plugins for `Event`s, plugins → game for
+  `Action`s. Plugins have no direct access to the world.
+  - `Dispatcher::dispatch(Event)` queues an event for the plugin thread, which calls
+    every handler plugin by plugin in name order. Each handler call gets the full
+    execution limit, and a failing handler is logged without stopping the others.
+  - Actions go through a bounded channel (1024) that core drains. When it is full,
+    `server.broadcast` raises a Lua error instead of blocking.
+  - Events so far: `player_join`, with a read-only `{ name, uuid }` table. The UUID
+    is the persistent identity; the XUID is never exposed.
+  - Luau API: `server.on(event, handler)` (unknown event names are an error) and
+    `server.broadcast(message)` (Raw chat to every player; empty messages are an error).
+    The `server` table is read-only after sandboxing. Handlers live in the VM's
+    registry, so a reload drops the old ones with the old VM.
+  - Reload debouncing uses its own deadline, so a steady stream of events cannot
+    postpone reloads.
 - **Hot reload (implemented):** a `notify` watcher on `plugins/` (non-recursive,
   `*.luau`) debounced by 200 ms. Once a file stops changing, the plugin is reloaded into
   a fresh VM, or unloaded if the file was deleted. A reload that fails logs the error
@@ -628,14 +656,15 @@ Each step starts only after explicit confirmation.
 | 2 | `mistvale_net` draft: signaling server, SDP, identity, segmenter/reassembler with tests, str0m peer driver | Compiles, tests pass, and `curl` against `/v1/join` works. A live 26.51 client handshake is the real test and may need iteration. | ✅ done 2026-09-25; a vanilla 1.26.51 client connected over LAN |
 | 3 | `mistvale_plugins` Luau bridge: load `plugins/*.luau` into a sandbox and route `print` to the log | The `plugins/hello.luau` smoke test works | ✅ done 2026-09-25 (prints on boot; hot reload verified live) |
 | 4 | Protocol handshake: batch codec, NetworkSettings → Login → resource packs; ICE-lite so sends only use paths the client proved | A live client gets past RequestNetworkSettings and receives Mistvale's disconnect message | ✅ done 2026-09-25; a vanilla 1.26.51 client over ICE-lite showed the disconnect message (commit `5aab46c`) |
-| 5 | World spawning: StartGame, empty registries, hashed block IDs, flat chunks, PlayerSpawn → SetLocalPlayerAsInitialized | A live client leaves "Building terrain" and stands on grass | 🧪 ready for a live test (2026-09-25) |
+| 5 | World spawning: StartGame, empty registries, hashed block IDs, flat chunks, PlayerSpawn → SetLocalPlayerAsInitialized | A live client leaves "Building terrain" and stands on grass | ✅ done 2026-09-25; a vanilla 1.26.51 client spawned on the grass at (8, -60, 8) (commit `98908a5`) |
+| 6 | Plugins meet the world: `player_join` event, Text packet and chat relay, Luau `server.on` / `server.broadcast`, welcome message in `hello.luau` | A live client sees the welcome message, and chat is echoed | 🧪 ready for a live test (2026-09-25) |
 
 Later steps are proposed but not yet scheduled:
 - player auth (JWKS verification of the multiplayer token)
 - vanilla item and biome data (ItemRegistry, BiomeDefinitionList, CreativeContent)
 - the core tick loop and world
 - chunk streaming
-- the plugin host API and hot reload
+- more plugin events (chat, quit) and actions
 - the JS/TS and Python engines
 - persistence
 
@@ -647,10 +676,11 @@ Later steps are proposed but not yet scheduled:
   ICE-lite, the client completed the step 4 login handshake: compressed batches both ways,
   and Mistvale's Disconnect message was displayed. Still unverified:
   - NAT'd or public deployments using advertised addresses
-- **Minimal registries are untested with a live client.** The spawn sends an empty
-  ItemRegistry and no BiomeDefinitionList, mirroring gophertunnel's minimal server. If
-  the client stalls or crashes, vanilla item and biome data are needed. They would come
-  from a BDS data dump, which is subject to licensing (see below).
+- **Minimal registries work for spawning.** The spawn sends an empty ItemRegistry and no
+  BiomeDefinitionList, mirroring gophertunnel's minimal server. A live 1.26.51 client
+  spawned with them on 2026-09-25. Inventories and the creative menu stay empty until
+  vanilla item data arrives, which would come from a BDS data dump subject to licensing
+  (see below).
 - **str0m's SDP candidate parser is strict.** It expects the `ufrag` extension after
   `network-id`, while libwebrtc (and so our answer) writes it before. It then silently
   drops the candidate. This only affects str0m acting as a client, as in the loopback
@@ -659,7 +689,8 @@ Later steps are proposed but not yet scheduled:
   DTLS fingerprints, which binds the session to that key. We do not yet verify the
   GameServerToken's RS256 signature against the Minecraft auth service JWKS, so the
   claimed identity is unproven. The discovery URL, issuer and JWKS still need to be
-  confirmed.
+  confirmed. Until then the name and UUID plugins see are claims, and must not guard
+  permissions. A second login with the same UUID is not kicked yet either.
 - **Send segment size.** str0m's direct API caps what we send at 64 KiB per SCTP message
   (§3.4). That is valid NetherNet, but smaller than BDS's 256 KiB. It could be lifted
   upstream or by switching engines.

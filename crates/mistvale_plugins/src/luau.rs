@@ -6,10 +6,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mlua::{Function, Lua, MultiValue, Value, VmState};
+use mlua::{Function, Lua, MultiValue, Table, Value, VmState};
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tracing::Level;
 
-use crate::Output;
+use crate::{Action, Event, Output};
+
+/// Registry key of each VM's table of event handlers: event name → list of functions.
+const HANDLERS: &str = "mistvale.handlers";
 
 /// Resource limits applied to every plugin VM.
 #[derive(Debug, Clone, Copy)]
@@ -23,6 +27,7 @@ pub(crate) struct Limits {
 pub(crate) struct LuauEngine {
     limits: Limits,
     output: Output,
+    actions: mpsc::Sender<Action>,
     plugins: BTreeMap<String, Plugin>,
 }
 
@@ -33,10 +38,11 @@ struct Plugin {
 }
 
 impl LuauEngine {
-    pub fn new(limits: Limits, output: Output) -> Self {
+    pub fn new(limits: Limits, output: Output, actions: mpsc::Sender<Action>) -> Self {
         Self {
             limits,
             output,
+            actions,
             plugins: BTreeMap::new(),
         }
     }
@@ -64,11 +70,20 @@ impl LuauEngine {
         self.plugins.keys().cloned().collect()
     }
 
+    /// Calls every handler for `event`, plugin by plugin in name order. A
+    /// handler that fails is logged and skipped.
+    pub fn dispatch(&self, event: &Event) {
+        for (name, plugin) in &self.plugins {
+            plugin.dispatch(name, event, self.limits.execution);
+        }
+    }
+
     fn create_plugin(&self, name: &str) -> mlua::Result<Plugin> {
         let lua = Lua::new();
         lua.set_memory_limit(self.limits.memory)?;
         // Globals become read-only once sandboxed, so install ours first.
         install_output(&lua, name, &self.output)?;
+        install_server(&lua, &self.actions)?;
         lua.sandbox(true)?;
 
         let deadline = Rc::new(Cell::new(None::<Instant>));
@@ -90,6 +105,109 @@ impl Plugin {
         self.deadline.set(None);
         result
     }
+
+    /// Calls this plugin's handlers for `event` in the order they were
+    /// registered, each within the execution limit.
+    fn dispatch(&self, plugin: &str, event: &Event, limit: Duration) {
+        let handlers = match self.handlers(event.name()) {
+            Ok(handlers) => handlers,
+            Err(err) => {
+                tracing::error!(
+                    plugin,
+                    event = event.name(),
+                    "failed to look up handlers: {err}"
+                );
+                return;
+            }
+        };
+        if handlers.is_empty() {
+            return;
+        }
+        let payload = match event_payload(&self.lua, event) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::error!(
+                    plugin,
+                    event = event.name(),
+                    "failed to build the event: {err}"
+                );
+                return;
+            }
+        };
+        for handler in handlers {
+            if let Err(err) = self.run(limit, || handler.call::<()>(&payload)) {
+                tracing::error!(plugin, event = event.name(), "event handler failed: {err}");
+            }
+        }
+    }
+
+    /// A snapshot of the handlers for `event`, so handlers may register more
+    /// while being called.
+    fn handlers(&self, event: &str) -> mlua::Result<Vec<Function>> {
+        let handlers: Table = self.lua.named_registry_value(HANDLERS)?;
+        match handlers.raw_get::<Option<Table>>(event)? {
+            Some(list) => list.sequence_values().collect(),
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+/// The value handlers receive: a read-only table describing the event.
+fn event_payload(lua: &Lua, event: &Event) -> mlua::Result<Table> {
+    let payload = match event {
+        Event::PlayerJoin(player) => {
+            let table = lua.create_table()?;
+            table.raw_set("name", player.name.as_str())?;
+            table.raw_set("uuid", player.uuid.as_str())?;
+            table
+        }
+    };
+    payload.set_readonly(true);
+    Ok(payload)
+}
+
+/// Adds the `server` table: `server.on(event, handler)` registers an event
+/// handler and `server.broadcast(message)` sends a chat message to everyone.
+fn install_server(lua: &Lua, actions: &mpsc::Sender<Action>) -> mlua::Result<()> {
+    lua.set_named_registry_value(HANDLERS, lua.create_table()?)?;
+    let server = lua.create_table()?;
+
+    let on = lua.create_function(|lua, (event, handler): (String, Function)| {
+        if !Event::NAMES.contains(&event.as_str()) {
+            return Err(mlua::Error::runtime(format!(
+                "unknown event {event:?}; expected one of: {}",
+                Event::NAMES.join(", ")
+            )));
+        }
+        let handlers: Table = lua.named_registry_value(HANDLERS)?;
+        let list = match handlers.raw_get::<Option<Table>>(event.as_str())? {
+            Some(list) => list,
+            None => {
+                let list = lua.create_table()?;
+                handlers.raw_set(event, &list)?;
+                list
+            }
+        };
+        list.raw_push(handler)
+    })?;
+    server.set("on", on)?;
+
+    let actions = actions.clone();
+    let broadcast = lua.create_function(move |_, message: String| {
+        if message.is_empty() {
+            return Err(mlua::Error::runtime("cannot broadcast an empty message"));
+        }
+        match actions.try_send(Action::Broadcast(message)) {
+            // A closed channel means the server is shutting down.
+            Ok(()) | Err(TrySendError::Closed(_)) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(mlua::Error::runtime(
+                "the server is not keeping up with plugin actions",
+            )),
+        }
+    })?;
+    server.set("broadcast", broadcast)?;
+
+    lua.globals().set("server", server)
 }
 
 /// Replaces `print` and adds a `log` table (`log.trace` … `log.error`) that
@@ -138,7 +256,12 @@ mod tests {
 
     type Lines = Arc<Mutex<Vec<(String, Level, String)>>>;
 
-    fn engine(limits: Limits) -> (LuauEngine, Lines) {
+    const DEFAULT_LIMITS: Limits = Limits {
+        memory: 16 * 1024 * 1024,
+        execution: Duration::from_millis(250),
+    };
+
+    fn engine_with_actions(limits: Limits) -> (LuauEngine, Lines, mpsc::Receiver<Action>) {
         let lines = Lines::default();
         let sink = Arc::clone(&lines);
         let output: Output = Arc::new(move |plugin, level, message| {
@@ -146,13 +269,23 @@ mod tests {
                 .unwrap()
                 .push((plugin.to_owned(), level, message.to_owned()));
         });
-        (LuauEngine::new(limits, output), lines)
+        let (actions, received) = mpsc::channel(16);
+        (LuauEngine::new(limits, output, actions), lines, received)
+    }
+
+    fn engine(limits: Limits) -> (LuauEngine, Lines) {
+        let (engine, lines, _) = engine_with_actions(limits);
+        (engine, lines)
     }
 
     fn default_engine() -> (LuauEngine, Lines) {
-        engine(Limits {
-            memory: 16 * 1024 * 1024,
-            execution: Duration::from_millis(250),
+        engine(DEFAULT_LIMITS)
+    }
+
+    fn steve_joins() -> Event {
+        Event::PlayerJoin(crate::Player {
+            name: "Steve".into(),
+            uuid: "174319cc-f69f-30d8-a279-6ace57f2011e".into(),
         })
     }
 
@@ -279,5 +412,117 @@ mod tests {
         assert!(engine.load("hello", "hello.luau", "print('v2')").unwrap());
         assert!(engine.unload("hello"));
         assert!(!engine.unload("hello"));
+    }
+
+    #[test]
+    fn join_handlers_get_the_player_and_can_broadcast() {
+        let (mut engine, lines, mut actions) = engine_with_actions(DEFAULT_LIMITS);
+        engine
+            .load(
+                "welcome",
+                "welcome.luau",
+                r#"
+                    server.on("player_join", function(player)
+                        print(player.name, player.uuid)
+                        server.broadcast(`Welcome, {player.name}!`)
+                    end)
+                "#,
+            )
+            .unwrap();
+        assert!(
+            actions.try_recv().is_err(),
+            "nothing happens until someone joins"
+        );
+
+        engine.dispatch(&steve_joins());
+        assert_eq!(
+            messages(&lines),
+            ["Steve\t174319cc-f69f-30d8-a279-6ace57f2011e"]
+        );
+        assert_eq!(
+            actions.try_recv().unwrap(),
+            Action::Broadcast("Welcome, Steve!".into())
+        );
+    }
+
+    #[test]
+    fn unknown_events_are_rejected() {
+        let (mut engine, _) = default_engine();
+        let err = engine
+            .load(
+                "typo",
+                "typo.luau",
+                r#"server.on("player_joined", function() end)"#,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown event"), "{err}");
+    }
+
+    #[test]
+    fn a_failing_handler_does_not_stop_the_others() {
+        let (mut engine, lines) = default_engine();
+        engine
+            .load(
+                "a",
+                "a.luau",
+                r#"
+                    server.on("player_join", function(player) player.name = "Alex" end)
+                    server.on("player_join", function(player) print("a saw", player.name) end)
+                "#,
+            )
+            .unwrap();
+        engine
+            .load(
+                "b",
+                "b.luau",
+                r#"server.on("player_join", function(player) print("b saw", player.name) end)"#,
+            )
+            .unwrap();
+        engine.dispatch(&steve_joins());
+        assert_eq!(messages(&lines), ["a saw\tSteve", "b saw\tSteve"]);
+    }
+
+    #[test]
+    fn runaway_handlers_are_stopped() {
+        let (mut engine, lines) = default_engine();
+        engine
+            .load(
+                "spin",
+                "spin.luau",
+                r#"
+                    server.on("player_join", function() while true do end end)
+                    server.on("player_join", function() print("still here") end)
+                "#,
+            )
+            .unwrap();
+        let started = Instant::now();
+        engine.dispatch(&steve_joins());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(messages(&lines), ["still here"]);
+    }
+
+    #[test]
+    fn reloading_replaces_the_handlers() {
+        let (mut engine, lines) = default_engine();
+        let source = |version: &str| {
+            format!(r#"server.on("player_join", function() print("{version}") end)"#)
+        };
+        engine.load("hello", "hello.luau", &source("v1")).unwrap();
+        engine.load("hello", "hello.luau", &source("v2")).unwrap();
+        engine.dispatch(&steve_joins());
+        assert_eq!(messages(&lines), ["v2"]);
+    }
+
+    #[test]
+    fn broadcast_rejects_empty_messages_and_the_api_is_read_only() {
+        let (mut engine, _) = default_engine();
+        let err = engine
+            .load("empty", "empty.luau", r#"server.broadcast("")"#)
+            .unwrap_err();
+        assert!(err.to_string().contains("empty message"), "{err}");
+        let err = engine
+            .load("vandal", "vandal.luau", "server.broadcast = nil")
+            .unwrap_err();
+        assert!(err.to_string().contains("readonly"), "{err}");
     }
 }

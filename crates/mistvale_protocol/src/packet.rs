@@ -10,6 +10,7 @@ pub mod id {
     pub const RESOURCE_PACKS_INFO: u32 = 6;
     pub const RESOURCE_PACK_STACK: u32 = 7;
     pub const RESOURCE_PACK_CLIENT_RESPONSE: u32 = 8;
+    pub const TEXT: u32 = 9;
     pub const START_GAME: u32 = 11;
     pub const LEVEL_CHUNK: u32 = 58;
     pub const REQUEST_CHUNK_RADIUS: u32 = 69;

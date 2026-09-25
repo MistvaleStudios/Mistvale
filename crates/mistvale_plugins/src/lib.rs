@@ -11,13 +11,17 @@
 //! - `python`: Python via RustPython
 //!
 //! Only the Luau engine exists so far; [`PluginHost`] runs `*.luau` plugins.
+//! Plugins listen for game [`Event`]s with `server.on(name, handler)` and ask
+//! the server for [`Action`]s such as `server.broadcast(message)`.
 
+mod api;
 #[cfg(feature = "luau")]
 mod host;
 #[cfg(feature = "luau")]
 mod luau;
 mod output;
 
+pub use api::{Action, Event, Player};
 #[cfg(feature = "luau")]
-pub use host::{PluginConfig, PluginError, PluginHost};
+pub use host::{Dispatcher, PluginConfig, PluginError, PluginHost};
 pub use output::{Output, tracing_output};

@@ -13,10 +13,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use mistvale_core::server::{self, PLUGIN_ACTION_QUEUE, Server};
 use mistvale_core::session;
 use mistvale_core::world::FlatWorld;
 use mistvale_net::{Connection, Listener, ListenerConfig, ServerStatus};
 use mistvale_plugins::{PluginConfig, PluginHost};
+use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -35,9 +37,15 @@ async fn main() -> anyhow::Result<()> {
         "Mistvale BDS"
     );
 
-    let plugins =
-        PluginHost::start(PluginConfig::default()).context("failed to start the plugin host")?;
+    let (actions, plugin_actions) = mpsc::channel(PLUGIN_ACTION_QUEUE);
+    let plugins = PluginHost::start(PluginConfig::default(), actions)
+        .context("failed to start the plugin host")?;
     tracing::info!(loaded = ?plugins.loaded(), "plugins ready");
+    let server = Arc::new(Server::new(FlatWorld::new(), plugins.dispatcher()));
+    tokio::spawn(server::apply_plugin_actions(
+        Arc::clone(&server),
+        plugin_actions,
+    ));
 
     let status = ServerStatus {
         name: "Mistvale BDS".into(),
@@ -48,7 +56,6 @@ async fn main() -> anyhow::Result<()> {
         max_players: 20,
         game_type: 0,
     };
-    let world = Arc::new(FlatWorld::new());
     let mut listener = Listener::bind(listener_config()?, status)
         .await
         .context("failed to start the NetherNet listener")?;
@@ -63,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             connection = listener.accept() => match connection {
                 Some(connection) => {
-                    tokio::spawn(serve(connection, Arc::clone(&world)));
+                    tokio::spawn(serve(connection, Arc::clone(&server)));
                 }
                 None => break,
             },
@@ -78,14 +85,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Runs a client's protocol session until it disconnects.
-async fn serve(connection: Connection, world: Arc<FlatWorld>) {
+async fn serve(connection: Connection, server: Arc<Server>) {
     let network_id = connection.network_id();
     tracing::info!(
         network_id,
         issuer = ?connection.client_identity().map(|identity| &identity.issuer),
         "client connected"
     );
-    session::run(connection, world).await;
+    session::run(connection, server).await;
     tracing::info!(network_id, "client disconnected");
 }
 
