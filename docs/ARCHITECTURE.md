@@ -1,0 +1,617 @@
+# Mistvale BDS — Architecture
+
+Living design document. Plan approved 2026-09-25; research is current as of that date.
+
+| | |
+|---|---|
+| Target | Minecraft Bedrock Edition **26.51**, network protocol **2193** |
+| Transport | **NetherNet only** (WebRTC). RakNet is not implemented. |
+| Language | Rust, edition 2024, MSRV 1.93, safe Rust (`unsafe_code = "forbid"`), tokio |
+| Plugins | Zero-build, hot-reloaded scripts: Luau (`mlua`), JS/TS (`deno_core`), Python (RustPython) |
+
+Contents: [1 Goals](#1-goals-and-constraints) ·
+[2 Research findings](#2-research-findings) ·
+[3 NetherNet wire reference](#3-nethernet-wire-reference) ·
+[4 Architecture](#4-architecture) ·
+[5 Approved decisions](#5-approved-decisions-2026-09-25) ·
+[6 Build plan](#6-build-plan) ·
+[7 Risks](#7-risks-and-open-questions) ·
+[8 Sources](#8-sources)
+
+---
+
+## 1. Goals and constraints
+
+- A high-performance custom Bedrock dedicated server written in Rust.
+- Speak Bedrock 26.51 / protocol 2193 (released 2026-09-15 on Windows and PlayStation,
+  2026-09-16 elsewhere; server version 1.26.51.1).
+- NetherNet only. BDS has defaulted to `transport=nethernet` since 1.26.50, and 26.60
+  (in preview) removes RakNet entirely.
+- Plugins are plain text files in `plugins/`, loaded and hot-reloaded with no build step.
+- Safe Rust: our crates forbid `unsafe`. FFI stays inside `mlua` and `rusty_v8`.
+
+## 2. Research findings
+
+### 2.1 Confirmed from the original brief
+
+- 26.51 is protocol 2193.
+- Signaling runs over HTTP on the server's TCP port (default 19132), under `/v1/join`.
+- Game traffic runs over UDP on the `ReliableDataChannel` and `UnreliableDataChannel`
+  WebRTC data channels.
+
+### 2.2 Corrections to the original brief
+
+1. **Exact endpoints.** `GET /v1/join` is both the capability probe and the server-list
+   status. `POST /v1/join/{networkId}` exchanges the SDP offer and answer
+   ([§3.1](#31-signaling-http-on-the-tcp-server-port)).
+2. **A mandatory `a=identity` (RFC 8827) in the SDP answer.** The brief does not mention
+   it, and the client rejects answers without it ([§3.2](#32-identity-assertion-rfc-8827)).
+3. **Segmentation is not a fixed "> 10,000 bytes" rule.** Every message carries a 1-byte
+   countdown, and the segment payload is the negotiated `max-message-size` − 1
+   ([§3.4](#34-data-channel-framing-segmentation)). The 10,000 figure comes from
+   `df-mc/nethernet-spec`, which was reverse-engineered from 1.20.50. It survives only as
+   a stale doc comment in go-nethernet.
+4. **Framing above the transport.** There is no `0xFE` batch header and no app-level
+   encryption. Compression and batching still apply ([§3.5](#35-game-packet-framing)).
+
+DeepWiki's AI-generated page on Mojang's docs describes a uint32 fragment header. That
+contradicts both Mojang's guide and go-nethernet's code, so it is disregarded.
+
+### 2.3 Reference projects
+
+- **WaterdogPE** (Java proxy)
+  - Runs RakNet and NetherNet side by side, using a bundled libdatachannel.
+  - Signaling modes: `builtin`, `nxs` (external provider), `hybrid` and `plugin`.
+  - Signaling defaults to the listener port. Media uses `udp_port`: 0 means an ephemeral
+    port per peer, and a fixed port means ICE UDP muxing.
+  - `server_type: bedrock` probes a backend's `GET /v1/join` to pick the transport.
+  - Reverse proxies must forward both routes.
+  - The P-384 identity key (`identity_file`) must be shared across proxy instances.
+  - *Takeaways:* keep signaling behind a trait, and make the identity key portable.
+- **Pumpkin** (Rust)
+  - Merged 26.51 support on 2026-09-17 (PR #3472).
+  - NetherNet uses the `webrtc` crate plus axum, with a P-384 identity and hashed Bedrock
+    block IDs.
+  - Uses tokio for I/O and rayon for CPU-bound work. Plugins run via wasmtime and native
+    libraries.
+  - Explored LAN discovery (UDP 7551) in PR #2825, then dropped it on 2026-09-22 in favor
+    of HTTP signaling.
+- **Dragonfly** (Go)
+  - Each world is owned by a single goroutine, and every mutation runs in a transaction
+    (`world.Tx`). Code running elsewhere schedules closures with `World.Do`, so the hot
+    path needs no locks.
+  - `Loader`/`Viewer` stream chunks to players.
+  - Sub-chunks are paletted storages with bits per block ∈ {0,1,2,3,4,5,6,8,16}.
+  - Network block IDs are FNV-1a-32 hashes of the block's `{name, states}` NBT, with
+    `UseBlockNetworkIDHashes` set in StartGame.
+  - Worlds persist to LevelDB (`mcdb`).
+  - NetherNet support (PR #1290) is built on go-nethernet:
+    - Its UDP mux defaults to 19133, because pion fails with `EADDRINUSE` next to RakNet
+      on 0.0.0.0:19132.
+    - Its built-in signaling is plaintext HTTP, with TLS left to a reverse proxy.
+- **go-nethernet / gophertunnel** (Go): the reference implementation of the wire details
+  in §3.
+- **Mojang/bedrock-protocol-docs**
+  - Official packet, type and enum JSON schemas for each release (tag `v1.26.51` = 2193),
+    plus the NetherNet onboarding guide.
+  - The schemas are machine-readable: `x-underlying-type`, `x-ordinal-index`,
+    `x-serialization-options`, and packet IDs in `$metaProperties["[cereal:packet]"]`.
+  - Licensed "All rights reserved" under the Minecraft EULA. **Use as a reference only;
+    never vendor it into this repository.**
+
+## 3. NetherNet wire reference
+
+### 3.1 Signaling (HTTP on the TCP server port)
+
+Clients request the signaling endpoint on exactly the host and port the player entered,
+with no fallback ports. They try HTTPS first, then plain HTTP.
+
+**`GET /v1/join`** is the capability probe and the server-list status.
+
+- Any 2xx means NetherNet is supported. Any other status makes the client abort.
+- The response is `Content-Type: application/json`.
+- `gameType` values: 0 Survival, 1 Creative, 2 Adventure.
+
+```json
+{
+  "name": "Dedicated Server",
+  "protocol": 2193,
+  "version": "1.26.51",
+  "level": "Bedrock level",
+  "players": 0,
+  "maxPlayers": 10,
+  "gameType": 0
+}
+```
+
+**`POST /v1/join/{networkId}`** exchanges the SDP offer and answer.
+
+- `networkId` is an opaque client identifier, currently a decimal u64.
+- The request body is the SDP offer (`application/sdp`, UTF-8) with every ICE candidate
+  inline.
+- A 2xx response carries the SDP answer (`application/sdp`) with every candidate inline.
+- The client sends exactly one request per attempt and never retries. Any non-2xx
+  response ends the attempt.
+
+Mistvale mirrors go-nethernet's handler:
+
+| Condition | Response |
+|---|---|
+| Missing or invalid `networkId`, empty body | 400 |
+| Offer larger than 1 MiB | 413 |
+| Offer not admitted | 503 |
+| Negotiation took longer than 15 s | 502 |
+
+Error bodies are `text/plain`.
+
+### 3.2 Identity assertion (RFC 8827)
+
+**Attribute format**
+
+- Both the offer and the answer carry a session-level `a=identity:<base64(JSON)>`
+  (standard, padded base64), placed before the first `m=` line.
+- The decoded JSON is `{"assertion":"<string>","idp":{"domain":"<domain>","protocol":"default"}}`.
+  The `assertion` value is itself JSON encoded as a string (double-encoded):
+  `{"fingerprints":"<detached JWS>","token":"<JWT>"}`.
+- `fingerprints` is a detached JWS (RFC 7515 Appendix F) in the compact form
+  `base64url(header)..base64url(signature)`.
+- The JWS covers the canonical JSON of the SDP's `a=fingerprint` lines:
+  `{"fingerprint":[{"algorithm":"sha-256","digest":"AA:BB:..."}]}`.
+  Canonical means sorted keys, no insignificant whitespace and minimal escaping
+  (a subset of RFC 8785).
+
+**Client offer.** The `token` is the player's GameServerToken from the Minecraft auth
+service. It is RS256-signed (per go-nethernet), carries the XUID, UUID and PlayFabId, and
+includes a `cpk` claim with the client's P-384 public key. 26.40+ clients send `cpk` as a
+JWK object; older clients sent a base64 SPKI DER string. `idp.domain` names the issuer,
+observed from a 1.26.51 client as `https://authorization.franchise.minecraft-services.net/`
+(with the trailing slash). The server:
+
+1. Validates the JWT signature against the auth service's keys.
+2. Rebuilds the fingerprint JSON from the offer.
+3. Verifies the JWS with `cpk`.
+4. Authorizes the player.
+5. **Strips `a=identity` before handing the SDP to WebRTC.** Unknown attributes cause the
+   SDP to be rejected.
+
+Over HTTP, any non-2xx response rejects the player. go-nethernet uses
+`ErrorCodeIdentityNotAllowed` (37) on its other signaling transports.
+
+**Server answer**
+
+- The `token` is a self-signed ES384 JWT. Mistvale shapes it like BDS does (per
+  go-nethernet):
+  - header `{"alg":"ES384","x5u":"<base64 SPKI DER public key>"}`
+  - claims `cpk` (our public key as a JWK, RFC 7517), `iat`, and `exp` = `iat` + 60 s
+- Mojang's guide also recommends `iss`, which the trust prompt would display. BDS omits it.
+- `idp.domain` is `"self"`, as on BDS.
+- `fingerprints` is a detached JWS (`{"alg":"ES384"}` header) over the answer's
+  fingerprints, signed with the same key.
+- **The answer must always include `a=identity`.**
+
+**How the client verifies our answer**
+
+1. It checks the JWT self-signature using `cpk`, then the fingerprint JWS, then `exp`.
+2. It applies a trust anchor:
+   - **HTTPS:** accepted silently, because TLS authenticates the endpoint.
+   - **Plain HTTP:** trust on first use (TOFU). A pinned key is accepted. An unknown key
+     triggers a prompt that shows the key fingerprint, and an accepted key is pinned.
+3. **Changing our key re-prompts every player.**
+
+### 3.3 WebRTC session
+
+**Transport settings**
+
+- Data channels only, with no audio or video.
+- UDP only (TCP candidates disabled), `max-bundle`, and no trickle ICE.
+- No STUN/TURN by default, so only host candidates are exchanged. The server must
+  therefore put a client-reachable address in its answer's candidates, via a configurable
+  advertise address for NAT or a public IP.
+- ICE roles: the client is controlling and the server is controlled.
+- **Mistvale runs ICE-lite by default.** The answer carries a session-level `a=ice-lite`,
+  and the server never probes candidate pairs; it only answers the client's checks.
+  Every datagram therefore leaves through the socket that received the client's
+  traffic. Under full ICE, the server's own checks also tried pairs Windows cannot route,
+  e.g. from a VirtualBox host-only adapter to the LAN (error 10051); those failures were
+  harmless but noisy. `ListenerConfig::ice_lite` (`MISTVALE_ICE_LITE=false`) switches
+  back to full ICE.
+- str0m's ICE-lite agent accepts only host candidates, so advertised public addresses
+  are announced as host candidates in lite mode (standard for 1:1 NAT).
+
+**SDP**
+
+- Media line: `m=application 9 UDP/DTLS/SCTP webrtc-datachannel`.
+- Attributes: `a=sctp-port:5000` and `a=max-message-size:262144`.
+- The offer uses `a=setup:actpass`. Mojang's example answer uses `a=setup:active`; the
+  guide allows either active or passive.
+
+**Data channels.** The client creates both channels, and the server receives them
+(`ondatachannel`):
+
+| Label | Ordered | Reliable | maxRetransmits |
+|---|---|---|---|
+| `ReliableDataChannel` | yes | yes | default |
+| `UnreliableDataChannel` | no | no | 0 |
+
+**Connection sequence**
+
+1. The client gathers all its candidates.
+2. The client sends `POST /v1/join/{networkId}` with its offer.
+3. The server sets the remote description, creates an answer and gathers its candidates.
+4. The server responds 200 with the answer.
+5. ICE connectivity checks run.
+6. DTLS completes. The certificate must match `a=fingerprint`.
+7. The SCTP association is established.
+8. The data channels open.
+
+Answer layout written by `mistvale_net::sdp`. It mirrors go-nethernet's encoder, which
+works with vanilla clients:
+- `a=identity` is session-level, while `a=fingerprint` is media-level.
+- `a=ice-options:trickle` is always present.
+- There is no `a=end-of-candidates`.
+- Candidates use libwebrtc's extension format.
+
+```text
+v=0
+o=- <session-id> 2 IN IP4 127.0.0.1
+s=-
+t=0 0
+a=ice-lite                                (unless full ICE is configured)
+a=group:BUNDLE <mid>
+a=extmap-allow-mixed
+a=msid-semantic: WMS
+a=identity:<base64 identity JSON>
+m=application <default port> UDP/DTLS/SCTP webrtc-datachannel
+c=IN IP4 <default address>
+a=candidate:<foundation> 1 udp <priority> <ip> <port> typ host generation 0 ufrag <ufrag> network-id 0 network-cost 0
+a=ice-ufrag:<ufrag>
+a=ice-pwd:<pwd>
+a=ice-options:trickle
+a=fingerprint:sha-256 <OUR:DTLS:CERT:DIGEST>
+a=setup:active
+a=mid:<mid, echoed from the offer>
+a=sctp-port:5000
+a=max-message-size:262144
+```
+
+### 3.4 Data-channel framing (segmentation)
+
+- Every message on both channels is `[u8 remaining][payload]`.
+- `remaining` is the number of segments still to follow. **0 means a complete message or
+  the final segment.** A 3-segment message is `[0x02]…`, `[0x01]…`, `[0x00]…`. The
+  receiver accumulates payloads until it sees 0.
+- **Segment payload = negotiated SCTP `max-message-size` − 1**, which is 262,143 for
+  256 KiB. go-nethernet reads the size from the remote SDP. Sending smaller segments is
+  always valid.
+- Only the reliable channel fragments. On the unreliable channel the header is always
+  `0x00`, and oversize messages are dropped.
+- The u8 header allows at most 256 segments. go-nethernet refuses to send more than 255.
+- **Mistvale's current limits (str0m `DirectApi`):**
+  - We send segments of min(client `max-message-size`, 64 KiB) − 1 = 65,535 bytes, because
+    str0m's direct API cannot pass it the client's advertised size.
+  - We receive SCTP messages up to the 256 KiB we advertise.
+  - str0m buffers at most 128 KiB across streams, so outgoing segments wait in a
+    per-session queue, and `Connection::send` applies backpressure beyond 4 MiB.
+- The Mistvale receiver adds two protections:
+  - It enforces a strict countdown: a restart mid-message or a skipped value is a protocol
+    error, and the connection closes.
+  - It caps the reassembled size as a DoS guard.
+
+### 3.5 Game packet framing
+
+**What NetherNet removes**
+
+- No `0xFE` batch header: go-nethernet's `BatchHeader()` returns nil.
+- No app-level encryption: DTLS already encrypts, so go-nethernet's `DisableEncryption()`
+  returns true. There is no ServerToClientHandshake and no AES layer.
+
+**What still applies.** Compression and batching are independent of the transport:
+
+1. The first message is `RequestNetworkSettings`, uncompressed.
+   `ClientNetworkVersion` is an int32, big-endian.
+2. The server replies with `NetworkSettings` (packet ID 143). Its fields, in order:
+   - compression threshold, u16 (0 = disabled, 1 = compress everything)
+   - compression algorithm, u16
+   - client throttle enabled, bool
+   - client throttle threshold, u8
+   - client throttle scalar, f32
+3. After that, every message is `[algorithm u8][(varuint32 length, packet)…]`, and the
+   tail is compressed:
+   - `0x00`: zlib (raw DEFLATE)
+   - `0x01`: snappy
+   - `0xFF`: none
+4. gophertunnel caps a batch at 812 packets.
+
+The first client message is exactly `06 | C1 01 | 00 00 08 91`: a one-byte batch length
+(6), packet ID 193 as a varuint32, then protocol 2193 as a big-endian int32.
+
+**Login flow over NetherNet** (gophertunnel's server; implemented in
+`mistvale_core::session`). There is no ServerToClientHandshake step.
+
+| Client sends | Server replies |
+|---|---|
+| RequestNetworkSettings (193) | NetworkSettings (143): raw DEFLATE, threshold 256; compression starts for both sides. On a protocol mismatch, PlayStatus `LoginFailedClient`/`LoginFailedServer` instead. |
+| Login (1) | PlayStatus `LoginSuccess` (2) + ResourcePacksInfo (6), with no packs |
+| ClientCacheStatus (129) | nothing; the blob cache is not supported |
+| ResourcePackClientResponse (8) `downloadingfinished` | ResourcePackStack (7): gophertunnel's 8 exempted vanilla packs, base game version `1.26.51` |
+| ResourcePackClientResponse `resourcepackstackfinished` | StartGame is next. It is **not implemented**, so Mistvale sends Disconnect (5) with a message. |
+
+- **Packet layouts at protocol 2193:**
+  - `ResourcePackClientResponse` is a varuint32 tag (0 cancel, 1 downloading,
+    2 downloadingfinished, 3 resourcepackstackfinished) followed by the tag's name as a
+    string.
+  - `Disconnect` is a varint32 reason, a "hide screen" bool, then message and filtered
+    message.
+  - Lists use varuint32 counts, except the experiments list, which uses a u32.
+- **The Login connection request** holds two blobs, each prefixed with a u32 LE length:
+  - auth JSON `{AuthenticationType, Certificate: "{\"chain\":[…]}", Token}`
+  - the client-data JWT
+
+  The multiplayer `Token` carries `xid` (XUID), `xname` (gamertag) and `cpk`
+  (base64 SPKI DER).
+
+**Security consequence.** Without app-level encryption, a captured Login packet could be
+replayed; go-nethernet warns about this itself. Mistvale therefore requires the Login
+token's `cpk` to equal the key proven by the SDP `a=identity`, as gophertunnel does.
+Otherwise it sends Disconnect `NotAuthenticated`.
+
+**Player authentication chain** (gophertunnel `service` package):
+
+1. Minecraft services discovery.
+2. The auth service environment (`ServiceURI`, `Issuer`).
+3. The OpenID configuration and JWKS.
+4. Verify the multiplayer token.
+
+The exact URLs will be confirmed when auth is implemented.
+
+### 3.6 Ports and discovery
+
+| Port | Protocol | Use |
+|---|---|---|
+| 19132 (`server-port`) | TCP | HTTP(S) signaling |
+| 19133 (default, configurable) | UDP | WebRTC media for all peers, on one muxed socket |
+| 7551 | UDP | LAN discovery. BDS binds it; not planned for Mistvale. |
+
+Xbox Live and Realms use WebSocket signaling via `signal.franchise.minecraft-services.net`.
+That is out of scope.
+
+### 3.7 Version timeline
+
+| Release | Protocol | Date |
+|---|---|---|
+| 1.26.50 | 2193 | 2026-09-15 |
+| 1.26.51 (hotfix) | 2193 | 2026-09-15/16 |
+| 1.26.60 preview.21 → preview.28 | 2207 → 2216 | 2026-09-02 → 2026-09-22 |
+
+26.60 removes RakNet.
+
+## 4. Architecture
+
+### 4.1 Workspace layout
+
+```text
+D:/Mistvale/
+├── Cargo.toml              # workspace: resolver 3, edition 2024, MSRV 1.93, shared deps + lints
+├── docs/ARCHITECTURE.md    # this document
+├── keys/                   # runtime: identity.pem (auto-generated, git-ignored)
+├── plugins/                # hot-reloaded *.luau / *.ts / *.js / *.py
+└── crates/
+    ├── mistvale_protocol/  # varints, NBT, batch codec, packets @ 2193
+    ├── mistvale_net/       # signaling + WebRTC + segmentation → byte messages
+    ├── mistvale_plugins/   # engine trait, Luau/JS/Python hosts, hot reload
+    └── mistvale_core/      # 20 TPS loop, world, entities; binary `mistvale`
+```
+
+### 4.2 Dependency graph
+
+```text
+                 mistvale_core  (lib + bin `mistvale`)
+                /       |        \
+   mistvale_net  mistvale_protocol  mistvale_plugins
+```
+
+- The three leaf crates don't depend on each other, so each one builds and tests in
+  isolation.
+- `mistvale_net` only moves bytes and knows nothing about Minecraft packets.
+
+### 4.3 `mistvale_net`
+
+| Module | Responsibility |
+|---|---|
+| `signaling` | axum routes for `GET /v1/join` (status JSON from a `watch` channel) and `POST /v1/join/{networkId}`, with the limits and status codes in §3.1. Offers go through the `OfferHandler` trait so a proxy- or NXS-style provider can plug in. Serving TLS on the same port (peeking the first byte, `0x16`) is not implemented yet. |
+| `sdp` | Parses the data-channel-only offer (`a=identity` is read separately and never reaches str0m) and writes answers in the §3.3 layout. |
+| `identity` | Loads or creates the persistent P-384 key (`keys/identity.pem`, PKCS#8 PEM, 0600 on Unix) and signs answers (§3.2). For clients, verifies that the token's `cpk` key signed the offer's fingerprints; the token itself is **not** verified yet (§7). |
+| `mux` | One UDP socket per local address (default port 19133). Datagrams are routed to sessions by the STUN `USERNAME` ufrag, then by learned (local, remote) paths. Sends always leave through the socket bound to str0m's chosen source address. Windows `ConnectionReset` receive errors are ignored, and unroutable-pair send errors are logged only at trace level. |
+| `peer` | One tokio task per session driving str0m through `DirectApi`: ICE controlled, DTLS active, SCTP client, the client's channels matched by label. Handles segmentation, backpressure, a connect timeout, a 10 s ICE-disconnect grace and graceful close. |
+| `listener` | `Listener` / `ListenerConfig`. Discovers interfaces, generates one DTLS certificate at startup, answers offers and yields a `Connection` once the reliable channel opens. |
+| `segment` | Pure, I/O-free `split` / `Reassembler` (§3.4), with unit tests. |
+
+API: `Listener::bind(config, status)` → `accept()` → a `Connection` with
+`recv() -> Option<Message>`, `send(Bytes, Reliability)` and `client_identity()`.
+`Listener::update_status` changes what `GET /v1/join` reports.
+
+The `mistvale` binary starts a listener with the defaults. These environment variables
+override them:
+- `MISTVALE_SIGNALING_ADDR`
+- `MISTVALE_MEDIA_PORT`
+- `MISTVALE_MEDIA_IPS`
+- `MISTVALE_ADVERTISE_IPS`
+- `MISTVALE_ICE_LITE` (`false` switches to full ICE)
+
+For local testing, bind to `127.0.0.1` to avoid the Windows Firewall prompt.
+
+Tests: 26 unit tests plus `tests/loopback.rs`, an end-to-end session against a str0m client
+using its standard SDP API. That run covers signaling, identity in both directions, ICE,
+DTLS, SCTP, and multi-segment messages both ways.
+
+### 4.4 `mistvale_protocol`
+
+- **Primitives:** varint/zigzag, little-endian numerics, varuint32-prefixed strings.
+- **NBT:** written in-house, because existing crates target Java's big-endian format.
+  Supports Bedrock's little-endian (disk) and network (varint) flavors, serde-based.
+- **Batch codec:** as described in §3.5.
+- **Packets:** hand-written for the login path first. Later, an optional `xtask codegen`
+  can read a developer's local copy of Mojang's schemas (never committed).
+- **Versioning:** `PROTOCOL_VERSION = 2193`, structured so 26.60 (2216+) can be added
+  alongside it.
+- **Implemented:**
+
+  | Module | Contents |
+  |---|---|
+  | `io` | `Reader` / `Writer` primitives |
+  | `batch` | framing; raw DEFLATE / Snappy / none; a 16 MiB decompression cap and 812 packets per batch |
+  | `packet` | the varuint32 header with sub-client bits; `Packet` / `Encode` / `Decode` traits; IDs checked against Mojang's schemas |
+  | `packets` | the handshake packets |
+  | `login` | connection-request parsing and unverified identity claims |
+
+  23 unit tests, including a golden decode of a real client's first message. NBT is not
+  started yet.
+
+### 4.5 `mistvale_core`
+
+- **Game loop:** a dedicated OS thread with a fixed 50 ms step, not a tokio task, to avoid
+  scheduler jitter. The tokio runtime owns I/O, and bounded channels connect the two.
+- **Tick phases:** drain inbound → simulate → dispatch plugin events → flush one batch per
+  player. This gives natural batching and better compression.
+- **World:** a single owner, as in Dragonfly, with a chunk map per dimension.
+  - Sub-chunks use Bedrock's paletted storage.
+  - Network block IDs are hashed, with `UseBlockNetworkIDHashes` set.
+  - Chunks generate on a rayon pool, and results merge at the start of a tick.
+  - Each player has a chunk streaming radius.
+- **Metrics:** MSPT metrics, and bounded catch-up after tick overruns.
+- **Entities:** an ECS. `bevy_ecs` standalone is the leading candidate; the choice is made
+  when implementing core.
+- **Sessions (implemented):** `session::Handshake` is a sans-IO state machine for the §3.5
+  login flow. It returns replies to send, compression to enable afterwards, and whether to
+  close. `session::run` drives it over a NetherNet `Connection`.
+  - Any protocol error ends with a Disconnect **with a message**, so the client shows a
+    reason instead of timing out.
+  - After a Disconnect it waits up to 5 s for the client to hang up.
+
+  The tick loop, world and entities are not started yet.
+
+### 4.6 `mistvale_plugins`
+
+- **Threading:** each engine runs on its own OS thread, because the VMs are `!Send`, with
+  one isolated VM per plugin. Luau's thread is named `luau-plugins`. A `ScriptEngine`
+  trait will be extracted when the second engine arrives, so its shape comes from real
+  needs.
+- **Messaging only:** game → plugins for events, plugins → game for commands. Plugins have
+  no direct access to the world. The event and command API is not built yet.
+- **Hot reload (implemented):** a `notify` watcher on `plugins/` (non-recursive,
+  `*.luau`) debounced by 200 ms. Once a file stops changing, the plugin is reloaded into
+  a fresh VM, or unloaded if the file was deleted. A reload that fails logs the error
+  and keeps the running version. State-handoff hooks are not built yet.
+- **Luau (default, implemented)** in `mistvale_plugins::{host, luau}`. `PluginHost::start`
+  returns once every plugin has loaded, and a broken plugin never stops startup.
+  Each VM is set up in this order:
+  1. A memory limit (64 MiB by default).
+  2. `print` and a `log.{trace,debug,info,warn,error}` table, installed before
+     sandboxing so scripts cannot replace them. Output goes to `tracing` under the
+     `plugin` target through a swappable `Output` sink.
+  3. `Lua::sandbox(true)`: read-only libraries and globals, with script writes kept local.
+  4. An interrupt that aborts any call running past the execution limit (1 s by default).
+- **JS/TS (`js` feature):** a `deno_core` `JsRuntime`. TypeScript is transpiled on load
+  with `deno_ast`, so there is still no build step. Pulls a prebuilt V8 of more than
+  100 MB.
+- **Python (`python` feature):** RustPython 0.5. It is much slower than CPython and its
+  stdlib is incomplete.
+
+### 4.7 Cross-cutting
+
+- **Safety:** `unsafe_code = "forbid"` across the workspace. FFI `unsafe` stays inside
+  mlua, rusty_v8 and RustPython.
+- **Errors:** `thiserror` in libraries, `anyhow` in the binary.
+- **Logging:** `tracing`, filtered with `RUST_LOG`.
+- **Profiles:** the dev profile optimizes dependencies (opt-level 2), because pure-Rust
+  crypto, compression and the Luau VM are very slow unoptimized. Release builds use
+  thin LTO with line-table debug info.
+- **Configuration:** a `mistvale.toml` file is planned.
+
+## 5. Approved decisions (2026-09-25)
+
+**1. WebRTC engine: str0m 0.23 via `DirectApi`.** `webrtc` 0.21 is the fallback, behind
+the same `rtc` interface.
+- It is sans-IO, so one UDP socket can serve all peers and tests are deterministic.
+- `DirectApi` gives exact control of the SDP and the DTLS role. str0m's SDP path
+  hard-codes `passive` for an `actpass` offer, while Mojang's example answer uses `active`.
+- Crypto backend: str0m's default `aws-lc-rs` (approved 2026-09-25). We started on
+  `rust-crypto`, but it also compiled AWS-LC through dimpl's `rcgen` feature, so it built
+  two crypto stacks. AWS-LC builds on the dev machine without CMake or NASM.
+- Pumpkin uses `webrtc`, whose new architecture only went stable in July 2026.
+
+**2. Segment size = negotiated `max-message-size` − 1.** This matches Mojang's guide and
+go-nethernet, and the receiver accepts any segment size.
+
+**3. `keys/identity.pem` (P-384) is auto-generated on first run and git-ignored.**
+- `a=identity` requires it.
+- A stable key avoids repeated TOFU prompts.
+- HTTPS with a real certificate removes the prompt entirely.
+
+**4. `main.rs` lives in `mistvale_core` (bin `mistvale`).** This keeps exactly four crates.
+
+**5. JS (`js`) and Python (`python`) sit behind cargo features, off by default.**
+`deno_core` pulls a prebuilt V8 of more than 100 MB and links slowly. Keeping them off
+keeps everyday builds fast while the Luau bridge comes first.
+
+## 6. Build plan
+
+Each step starts only after explicit confirmation.
+
+| Step | Scope | Done when | Status |
+|---|---|---|---|
+| 1 | Workspace, dependencies, four crate skeletons, git | `cargo check --workspace` passes cleanly | ✅ done 2026-09-25 |
+| 2 | `mistvale_net` draft: signaling server, SDP, identity, segmenter/reassembler with tests, str0m peer driver | Compiles, tests pass, and `curl` against `/v1/join` works. A live 26.51 client handshake is the real test and may need iteration. | ✅ done 2026-09-25; a vanilla 1.26.51 client connected over LAN |
+| 3 | `mistvale_plugins` Luau bridge: load `plugins/*.luau` into a sandbox and route `print` to the log | The `plugins/hello.luau` smoke test works | ✅ done 2026-09-25 (prints on boot; hot reload verified live) |
+| 4 | Protocol handshake: batch codec, NetworkSettings → Login → resource packs; ICE-lite so sends only use paths the client proved | A live client gets past RequestNetworkSettings and receives Mistvale's disconnect message | ✅ done 2026-09-25; a vanilla 1.26.51 client over ICE-lite showed the disconnect message |
+
+Later steps are proposed but not yet scheduled:
+- player auth (JWKS verification of the multiplayer token)
+- StartGame and the packets that follow it, so a player spawns
+- the core tick loop and world
+- chunk streaming
+- the plugin host API and hot reload
+- the JS/TS and Python engines
+- persistence
+
+## 7. Risks and open questions
+
+- **Live-client interop: session setup verified.** On 2026-09-25 a vanilla Bedrock
+  1.26.51 client joined over LAN. Signaling, our identity assertion, ICE, DTLS (server
+  active), SCTP and the client's reliable data channel all worked. The same day, over
+  ICE-lite, the client completed the step 4 login handshake: compressed batches both ways,
+  and Mistvale's Disconnect message was displayed. Still unverified:
+  - NAT'd or public deployments using advertised addresses
+- **str0m's SDP candidate parser is strict.** It expects the `ufrag` extension after
+  `network-id`, while libwebrtc (and so our answer) writes it before. It then silently
+  drops the candidate. This only affects str0m acting as a client, as in the loopback
+  test, which normalizes the lines.
+- **Players are not authenticated yet.** We verify that the offer's `cpk` key signed its
+  DTLS fingerprints, which binds the session to that key. We do not yet verify the
+  GameServerToken's RS256 signature against the Minecraft auth service JWKS, so the
+  claimed identity is unproven. The discovery URL, issuer and JWKS still need to be
+  confirmed.
+- **Send segment size.** str0m's direct API caps what we send at 64 KiB per SCTP message
+  (§3.4). That is valid NetherNet, but smaller than BDS's 256 KiB. It could be lifted
+  upstream or by switching engines.
+- **UDP reachability.** The media port must be reachable through NAT and firewalls, which
+  needs an advertise-address setting.
+- **Data licensing.** Block palette, item and creative data come from BDS dumps, and
+  Mojang's schemas are under the EULA.
+- **Optional engines.** `deno_core` is large and slow to compile; RustPython performs
+  poorly.
+- **26.60** will bump the protocol (2216+ in preview).
+
+## 8. Sources
+
+- [Mojang — NetherNet HTTP Signaling Partner Onboarding Guide](https://mojang.github.io/bedrock-protocol-docs/guides/nether-net-onboarding-guide/)
+- [Mojang/bedrock-protocol-docs](https://github.com/Mojang/bedrock-protocol-docs) · [releases](https://github.com/Mojang/bedrock-protocol-docs/releases)
+- [df-mc/nethernet-spec](https://github.com/df-mc/nethernet-spec) (1.20.50-era)
+- [df-mc/go-nethernet](https://github.com/df-mc/go-nethernet) (`conn.go`, `listener.go`, `identity.go`, `endpoint/handler.go`)
+- [Sandertv/gophertunnel](https://github.com/Sandertv/gophertunnel) (`minecraft/protocol/packet` encoder/decoder, `minecraft/service`)
+- [Bedrock Edition 26.51 — Minecraft Wiki](https://minecraft.wiki/w/Bedrock_Edition_26.51)
+- [WaterdogPE — NetherNet Configuration](https://docs.waterdog.dev/waterdogpe-setup/nethernet-configuration)
+- [Dragonfly PR #1290 — first-class NetherNet support](https://github.com/df-mc/dragonfly/pull/1290) · [world package](https://pkg.go.dev/github.com/df-mc/dragonfly/server/world)
+- [Pumpkin PR #3472 — 26.51](https://github.com/Pumpkin-MC/Pumpkin/pull/3472) · [PR #2825 — LAN discovery](https://github.com/Pumpkin-MC/Pumpkin/pull/2825)
+- [playit.gg — NetherNet vs RakNet](https://playit.gg/support/minecraft-bedrock-nethernet/)
+- [str0m](https://github.com/algesten/str0m) · [webrtc v0.20 announcement](https://webrtc.rs/blog/2026/07/31/announcing-webrtc-v0.20.0.html)

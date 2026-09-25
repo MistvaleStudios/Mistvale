@@ -1,0 +1,5 @@
+/target
+
+# Server identity private key (auto-generated on first run) — never commit.
+/keys/
+*.pem

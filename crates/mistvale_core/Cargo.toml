@@ -1,0 +1,30 @@
+[package]
+name = "mistvale_core"
+description = "Mistvale BDS game server: 20 TPS game loop, worlds, chunks and entities"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+default-run = "mistvale"
+
+[[bin]]
+name = "mistvale"
+path = "src/main.rs"
+
+[features]
+js = ["mistvale_plugins/js"]
+python = ["mistvale_plugins/python"]
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+mistvale_net.workspace = true
+mistvale_plugins.workspace = true
+mistvale_protocol.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

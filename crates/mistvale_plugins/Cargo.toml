@@ -1,0 +1,26 @@
+[package]
+name = "mistvale_plugins"
+description = "Hot-reloading polyglot plugin engine for Mistvale BDS (Luau, JS/TS, Python)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+default = ["luau"]
+luau = ["dep:mlua"]
+js = ["dep:deno_core", "dep:deno_ast"]
+python = ["dep:rustpython-vm"]
+
+[dependencies]
+deno_ast = { workspace = true, optional = true }
+deno_core = { workspace = true, optional = true }
+mlua = { workspace = true, optional = true }
+notify.workspace = true
+rustpython-vm = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+
+[lints]
+workspace = true
