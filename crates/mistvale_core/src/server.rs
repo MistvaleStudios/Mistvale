@@ -84,11 +84,9 @@ impl Server {
 
     /// Replaces the block at `pos` with air. Every player whose client has
     /// that chunk sees the change and the breaking particles, and hears it.
-    /// Breaking air does nothing.
-    pub fn break_block(&self, pos: BlockPos) {
-        let Some(broken) = self.world.replace_block(pos, self.world.air()) else {
-            return;
-        };
+    /// Breaking air does nothing. Returns the block broken, if any.
+    pub fn break_block(&self, pos: BlockPos) -> Option<u32> {
+        let broken = self.world.replace_block(pos, self.world.air())?;
         let chunk = ChunkPos::of_block(pos);
         self.players
             .send_to_viewers(chunk, &block_update(pos, self.world.air()));
@@ -99,6 +97,7 @@ impl Server {
         };
         self.players
             .send_to_viewers(chunk, &Bytes::from(effect.encode()));
+        Some(broken)
     }
 
     /// Puts `block` at `pos` if it is air there and no player's body is in
@@ -131,8 +130,41 @@ impl Server {
                 tracing::info!(target: "chat", recipients = self.players.count(), "[broadcast] {message}");
                 self.players.broadcast_message(&message);
             }
+            Action::SendMessage { player, message } => {
+                let Some(uuid) = plugin_player(&player) else {
+                    return;
+                };
+                match self.players.name_of(uuid) {
+                    Some(name) if self.players.send_message(uuid, &message) => {
+                        tracing::info!(target: "chat", "[to {name}] {message}");
+                    }
+                    _ => tracing::debug!(%uuid, "a plugin messaged a player who is not online"),
+                }
+            }
+            Action::Kick { player, reason } => {
+                let Some(uuid) = plugin_player(&player) else {
+                    return;
+                };
+                if self.logins.kick(uuid, reason.clone()) {
+                    tracing::info!(%uuid, %reason, "a plugin kicked a player");
+                } else {
+                    tracing::debug!(%uuid, "a plugin kicked a player who is not online");
+                }
+            }
         }
     }
+}
+
+/// The UUID a plugin named a player by, logging a malformed one.
+fn plugin_player(uuid: &str) -> Option<Uuid> {
+    let parsed = Uuid::parse_str(uuid).ok();
+    if parsed.is_none() {
+        tracing::warn!(
+            uuid,
+            "a plugin named a player by something that is not a UUID"
+        );
+    }
+    parsed
 }
 
 /// An encoded UpdateBlock setting `pos` to `block`.
@@ -165,6 +197,7 @@ pub async fn apply_plugin_actions(server: Arc<Server>, mut actions: mpsc::Receiv
 #[cfg(test)]
 mod tests {
     use mistvale_protocol::packet::{self, id};
+    use mistvale_protocol::packets::DisconnectReason;
     use uuid::Uuid;
 
     use super::*;
@@ -275,6 +308,54 @@ mod tests {
         // Beside them and above their head is fine.
         assert!(server.place_block(BlockPos { x: 9, y: -60, z: 8 }, stone));
         assert!(server.place_block(BlockPos { x: 8, y: -58, z: 8 }, stone));
+    }
+
+    #[test]
+    fn plugins_message_and_kick_single_players() {
+        let server = Server::new(
+            World::new(),
+            Dispatcher::disconnected(),
+            Authenticator::offline(),
+        );
+        let (steve, mut steve_queue) = join_at(&server, "Steve", ChunkPos::new(0, 0));
+        let (_alex, mut alex_queue) = join_at(&server, "Alex", ChunkPos::new(0, 0));
+        ids(&mut steve_queue);
+        ids(&mut alex_queue);
+        let steve_uuid = server
+            .players
+            .saved()
+            .into_iter()
+            .map(|(uuid, _)| uuid)
+            .find(|uuid| server.players.name_of(*uuid).as_deref() == Some("Steve"))
+            .unwrap();
+
+        server.apply(Action::SendMessage {
+            player: steve_uuid.to_string(),
+            message: "psst".into(),
+        });
+        assert_eq!(ids(&mut steve_queue), [id::TEXT]);
+        assert!(ids(&mut alex_queue).is_empty(), "only Steve hears it");
+        // Unknown players and malformed UUIDs are ignored.
+        server.apply(Action::SendMessage {
+            player: Uuid::new_v4().to_string(),
+            message: "psst".into(),
+        });
+        server.apply(Action::SendMessage {
+            player: "Steve".into(),
+            message: "psst".into(),
+        });
+        assert!(ids(&mut steve_queue).is_empty());
+
+        let (kick, mut kicks) = mpsc::channel(1);
+        let _claim = server.logins.claim(steve_uuid, kick);
+        server.apply(Action::Kick {
+            player: steve_uuid.to_string(),
+            reason: "Bye".into(),
+        });
+        let notice = kicks.try_recv().unwrap();
+        assert_eq!(notice.reason, DisconnectReason::KICKED);
+        assert_eq!(notice.message, "Bye");
+        drop(steve);
     }
 
     fn ids(queue: &mut mpsc::Receiver<Bytes>) -> Vec<u32> {

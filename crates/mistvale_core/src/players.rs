@@ -311,6 +311,33 @@ impl Players {
         self.broadcast_text(Text::system(message));
     }
 
+    /// Shows a message from the server in one player's chat, as a system
+    /// message. Returns whether that player is in the world.
+    pub fn send_message(&self, uuid: Uuid, message: &str) -> bool {
+        let text = Text::system(message);
+        if text.message.is_empty() || text.message.len() > Text::MAX_MESSAGE_LEN {
+            tracing::warn!(
+                len = text.message.len(),
+                "not sending a message that is empty or too long"
+            );
+            return false;
+        }
+        let online = self.online();
+        let Some(player) = online.values().find(|player| player.profile.uuid == uuid) else {
+            return false;
+        };
+        player.send(encode(&text));
+        true
+    }
+
+    /// The name of the player in the world as `uuid`, if they are.
+    pub fn name_of(&self, uuid: Uuid) -> Option<String> {
+        self.online()
+            .values()
+            .find(|player| player.profile.uuid == uuid)
+            .map(|player| player.profile.name.clone())
+    }
+
     /// Relays a player's chat message to everyone, including its author, as
     /// plain text.
     pub fn chat(&self, from: &str, message: &str) {

@@ -1,5 +1,5 @@
 //! The join path from the plugin event to the chat: the sample plugin must
-//! welcome a joining player exactly once.
+//! welcome a joining player exactly once, and greet them privately.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,7 +19,11 @@ async fn the_sample_plugin_welcomes_a_joining_player_once() {
     let directory = std::env::temp_dir().join(format!("mistvale-welcome-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).unwrap();
-    std::fs::copy("../../plugins/hello.luau", directory.join("hello.luau")).unwrap();
+    let hello = directory.join("hello");
+    std::fs::create_dir_all(&hello).unwrap();
+    for file in ["plugin.json", "main.luau"] {
+        std::fs::copy(format!("../../plugins/hello/{file}"), hello.join(file)).unwrap();
+    }
 
     let (actions, plugin_actions) = mpsc::channel(PLUGIN_ACTION_QUEUE);
     let config = PluginConfig {
@@ -82,5 +86,11 @@ async fn the_sample_plugin_welcomes_a_joining_player_once() {
     }
     drop(plugins);
     let _ = std::fs::remove_dir_all(&directory);
-    assert_eq!(texts, ["§eWelcome to Mistvale, Steve!"]);
+    assert_eq!(
+        texts,
+        [
+            "§eWelcome to Mistvale, Steve!",
+            "§7Only you can see this. Say §f!kickme§7 to test kicking."
+        ]
+    );
 }

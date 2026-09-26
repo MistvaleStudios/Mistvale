@@ -10,10 +10,13 @@ use mlua::{Function, Lua, MultiValue, Table, Value, VmState};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tracing::Level;
 
-use crate::{Action, Event, Output};
+use crate::{Action, Event, Output, Player};
 
 /// Registry key of each VM's table of event handlers: event name → list of functions.
 const HANDLERS: &str = "mistvale.handlers";
+
+/// What a kicked player is shown when the plugin gives no reason.
+const DEFAULT_KICK_REASON: &str = "You were kicked from the server.";
 
 /// Resource limits applied to every plugin VM.
 #[derive(Debug, Clone, Copy)]
@@ -71,11 +74,14 @@ impl LuauEngine {
     }
 
     /// Calls every handler for `event`, plugin by plugin in name order. A
-    /// handler that fails is logged and skipped.
-    pub fn dispatch(&self, event: &Event) {
+    /// handler that fails is logged and skipped. Returns whether a handler
+    /// cancelled the event; later handlers still run and can check.
+    pub fn dispatch(&self, event: &Event) -> bool {
+        let cancelled = Rc::new(Cell::new(false));
         for (name, plugin) in &self.plugins {
-            plugin.dispatch(name, event, self.limits.execution);
+            plugin.dispatch(name, event, &cancelled, self.limits.execution);
         }
+        cancelled.get()
     }
 
     fn create_plugin(&self, name: &str) -> mlua::Result<Plugin> {
@@ -108,7 +114,7 @@ impl Plugin {
 
     /// Calls this plugin's handlers for `event` in the order they were
     /// registered, each within the execution limit.
-    fn dispatch(&self, plugin: &str, event: &Event, limit: Duration) {
+    fn dispatch(&self, plugin: &str, event: &Event, cancelled: &Rc<Cell<bool>>, limit: Duration) {
         let handlers = match self.handlers(event.name()) {
             Ok(handlers) => handlers,
             Err(err) => {
@@ -123,7 +129,7 @@ impl Plugin {
         if handlers.is_empty() {
             return;
         }
-        let payload = match event_payload(&self.lua, event) {
+        let payload = match event_payload(&self.lua, event, cancelled) {
             Ok(payload) => payload,
             Err(err) => {
                 tracing::error!(
@@ -153,21 +159,96 @@ impl Plugin {
 }
 
 /// The value handlers receive: a read-only table describing the event.
-fn event_payload(lua: &Lua, event: &Event) -> mlua::Result<Table> {
+///
+/// - `player_join`, `player_quit`: the player, `{ name, uuid }`.
+/// - `player_chat`: `{ player, message, cancel(), is_cancelled() }`.
+/// - `block_break`, `block_place`: `{ player, position = { x, y, z }, block }`.
+fn event_payload(lua: &Lua, event: &Event, cancelled: &Rc<Cell<bool>>) -> mlua::Result<Table> {
     let payload = match event {
-        Event::PlayerJoin(player) => {
+        Event::PlayerJoin(player) | Event::PlayerQuit(player) => player_table(lua, player)?,
+        Event::PlayerChat { player, message } => {
             let table = lua.create_table()?;
-            table.raw_set("name", player.name.as_str())?;
-            table.raw_set("uuid", player.uuid.as_str())?;
+            table.raw_set("player", player_table(lua, player)?)?;
+            table.raw_set("message", message.as_str())?;
+            table
+        }
+        Event::BlockBreak(change) | Event::BlockPlace(change) => {
+            let position = lua.create_table()?;
+            position.raw_set("x", change.position.x)?;
+            position.raw_set("y", change.position.y)?;
+            position.raw_set("z", change.position.z)?;
+            position.set_readonly(true);
+            let table = lua.create_table()?;
+            table.raw_set("player", player_table(lua, &change.player)?)?;
+            table.raw_set("position", position)?;
+            table.raw_set("block", change.block.as_str())?;
             table
         }
     };
+    if event.is_cancellable() {
+        let cancel = Rc::clone(cancelled);
+        payload.raw_set(
+            "cancel",
+            lua.create_function(move |_, ()| {
+                cancel.set(true);
+                Ok(())
+            })?,
+        )?;
+        let cancel = Rc::clone(cancelled);
+        payload.raw_set(
+            "is_cancelled",
+            lua.create_function(move |_, ()| Ok(cancel.get()))?,
+        )?;
+    }
     payload.set_readonly(true);
     Ok(payload)
 }
 
-/// Adds the `server` table: `server.on(event, handler)` registers an event
-/// handler and `server.broadcast(message)` sends a chat message to everyone.
+fn player_table(lua: &Lua, player: &Player) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    table.raw_set("name", player.name.as_str())?;
+    table.raw_set("uuid", player.uuid.as_str())?;
+    table.set_readonly(true);
+    Ok(table)
+}
+
+/// The UUID of the player a plugin means: a player table from an event, or
+/// the UUID string itself.
+fn player_uuid(player: Value) -> mlua::Result<String> {
+    let uuid = match player {
+        Value::String(uuid) => uuid.to_str()?.to_owned(),
+        Value::Table(player) => player.get::<String>("uuid")?,
+        other => {
+            return Err(mlua::Error::runtime(format!(
+                "expected a player or a player's UUID, got a {}",
+                other.type_name()
+            )));
+        }
+    };
+    if uuid.is_empty() {
+        return Err(mlua::Error::runtime("the player's UUID is empty"));
+    }
+    Ok(uuid)
+}
+
+/// Queues `action` for the server.
+fn request(actions: &mpsc::Sender<Action>, action: Action) -> mlua::Result<()> {
+    match actions.try_send(action) {
+        // A closed channel means the server is shutting down.
+        Ok(()) | Err(TrySendError::Closed(_)) => Ok(()),
+        Err(TrySendError::Full(_)) => Err(mlua::Error::runtime(
+            "the server is not keeping up with plugin actions",
+        )),
+    }
+}
+
+/// Adds the `server` table:
+/// - `server.on(event, handler)` registers an event handler;
+/// - `server.broadcast(message)` sends a chat message to everyone;
+/// - `server.send_message(player, message)` sends one to a single player;
+/// - `server.kick(player, reason?)` disconnects a player.
+///
+/// Players are given as a player table from an event or as a UUID string.
 fn install_server(lua: &Lua, actions: &mpsc::Sender<Action>) -> mlua::Result<()> {
     lua.set_named_registry_value(HANDLERS, lua.create_table()?)?;
     let server = lua.create_table()?;
@@ -192,20 +273,34 @@ fn install_server(lua: &Lua, actions: &mpsc::Sender<Action>) -> mlua::Result<()>
     })?;
     server.set("on", on)?;
 
-    let actions = actions.clone();
+    let queue = actions.clone();
     let broadcast = lua.create_function(move |_, message: String| {
         if message.is_empty() {
             return Err(mlua::Error::runtime("cannot broadcast an empty message"));
         }
-        match actions.try_send(Action::Broadcast(message)) {
-            // A closed channel means the server is shutting down.
-            Ok(()) | Err(TrySendError::Closed(_)) => Ok(()),
-            Err(TrySendError::Full(_)) => Err(mlua::Error::runtime(
-                "the server is not keeping up with plugin actions",
-            )),
-        }
+        request(&queue, Action::Broadcast(message))
     })?;
     server.set("broadcast", broadcast)?;
+
+    let queue = actions.clone();
+    let send_message = lua.create_function(move |_, (player, message): (Value, String)| {
+        let player = player_uuid(player)?;
+        if message.is_empty() {
+            return Err(mlua::Error::runtime("cannot send an empty message"));
+        }
+        request(&queue, Action::SendMessage { player, message })
+    })?;
+    server.set("send_message", send_message)?;
+
+    let queue = actions.clone();
+    let kick = lua.create_function(move |_, (player, reason): (Value, Option<String>)| {
+        let player = player_uuid(player)?;
+        let reason = reason
+            .filter(|reason| !reason.is_empty())
+            .unwrap_or_else(|| DEFAULT_KICK_REASON.to_owned());
+        request(&queue, Action::Kick { player, reason })
+    })?;
+    server.set("kick", kick)?;
 
     lua.globals().set("server", server)
 }
@@ -524,5 +619,145 @@ mod tests {
             .load("vandal", "vandal.luau", "server.broadcast = nil")
             .unwrap_err();
         assert!(err.to_string().contains("readonly"), "{err}");
+    }
+
+    fn steve() -> crate::Player {
+        crate::Player {
+            name: "Steve".into(),
+            uuid: "174319cc-f69f-30d8-a279-6ace57f2011e".into(),
+        }
+    }
+
+    #[test]
+    fn chat_can_be_cancelled_and_later_handlers_see_it() {
+        let (mut engine, lines) = default_engine();
+        engine
+            .load(
+                "filter",
+                "filter.luau",
+                r#"
+                    server.on("player_chat", function(event)
+                        if event.message:find("spam") then event.cancel() end
+                    end)
+                "#,
+            )
+            .unwrap();
+        engine
+            .load(
+                "logger",
+                "logger.luau",
+                r#"
+                    server.on("player_chat", function(event)
+                        print(event.player.name, event.message, event.is_cancelled())
+                    end)
+                "#,
+            )
+            .unwrap();
+        let chat = |message: &str| Event::PlayerChat {
+            player: steve(),
+            message: message.into(),
+        };
+        assert!(engine.dispatch(&chat("buy spam")));
+        assert!(!engine.dispatch(&chat("hello")));
+        assert_eq!(
+            messages(&lines),
+            ["Steve\tbuy spam\ttrue", "Steve\thello\tfalse"]
+        );
+    }
+
+    #[test]
+    fn quit_and_block_events_describe_what_happened() {
+        let (mut engine, lines) = default_engine();
+        engine
+            .load(
+                "watch",
+                "watch.luau",
+                r#"
+                    server.on("player_quit", function(player) print("quit", player.name) end)
+                    local function changed(event)
+                        local at = event.position
+                        print(event.player.name, event.block, at.x, at.y, at.z, event.cancel)
+                    end
+                    server.on("block_break", changed)
+                    server.on("block_place", changed)
+                "#,
+            )
+            .unwrap();
+        let change = |block: &str| crate::BlockChange {
+            player: steve(),
+            position: crate::Position {
+                x: 1,
+                y: -60,
+                z: -2,
+            },
+            block: block.into(),
+        };
+        assert!(!engine.dispatch(&Event::BlockBreak(change("minecraft:grass_block"))));
+        engine.dispatch(&Event::BlockPlace(change("minecraft:stone")));
+        engine.dispatch(&Event::PlayerQuit(steve()));
+        assert_eq!(
+            messages(&lines),
+            [
+                "Steve\tminecraft:grass_block\t1\t-60\t-2\tnil",
+                "Steve\tminecraft:stone\t1\t-60\t-2\tnil",
+                "quit\tSteve",
+            ]
+        );
+    }
+
+    #[test]
+    fn plugins_can_message_and_kick_single_players() {
+        let (mut engine, _, mut actions) = engine_with_actions(DEFAULT_LIMITS);
+        engine
+            .load(
+                "moderator",
+                "moderator.luau",
+                r#"
+                    server.on("player_join", function(player)
+                        server.send_message(player, "Only you can see this")
+                        server.send_message(player.uuid, "And this")
+                        server.kick(player, "Come back later")
+                        server.kick(player.uuid)
+                    end)
+                "#,
+            )
+            .unwrap();
+        engine.dispatch(&steve_joins());
+        let uuid = steve().uuid;
+        let received: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok()).collect();
+        assert_eq!(
+            received,
+            [
+                Action::SendMessage {
+                    player: uuid.clone(),
+                    message: "Only you can see this".into()
+                },
+                Action::SendMessage {
+                    player: uuid.clone(),
+                    message: "And this".into()
+                },
+                Action::Kick {
+                    player: uuid.clone(),
+                    reason: "Come back later".into()
+                },
+                Action::Kick {
+                    player: uuid,
+                    reason: DEFAULT_KICK_REASON.into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn player_actions_need_a_player() {
+        let (mut engine, _) = default_engine();
+        for script in [
+            r#"server.send_message(42, "hi")"#,
+            r#"server.send_message("", "hi")"#,
+            r#"server.send_message({}, "hi")"#,
+            r#"server.kick(nil)"#,
+        ] {
+            assert!(engine.load("bad", "bad.luau", script).is_err(), "{script}");
+        }
     }
 }

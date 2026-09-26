@@ -27,7 +27,8 @@ Contents: [1 Goals](#1-goals-and-constraints) ·
   2026-09-16 elsewhere; server version 1.26.51.1).
 - NetherNet only. BDS has defaulted to `transport=nethernet` since 1.26.50, and 26.60
   (in preview) removes RakNet entirely.
-- Plugins are plain text files in `plugins/`, loaded and hot-reloaded with no build step.
+- Plugins are folders of plain text files in `plugins/`, each with a `plugin.json`
+  manifest, loaded and hot-reloaded with no build step.
 - Safe Rust: our crates forbid `unsafe`. FFI stays inside `mlua` and `rusty_v8`.
 
 ## 2. Research findings
@@ -767,20 +768,61 @@ DTLS, SCTP, and multi-segment messages both ways.
   - `Dispatcher::dispatch(Event)` queues an event for the plugin thread, which calls
     every handler plugin by plugin in name order. Each handler call gets the full
     execution limit, and a failing handler is logged without stopping the others.
+  - `Dispatcher::dispatch_cancellable(Event)` does the same and resolves to whether a
+    handler cancelled the event. Core waits at most 2 s for the verdict, then goes
+    ahead, so a stuck plugin cannot silence chat. Only `player_chat` is cancellable.
   - Actions go through a bounded channel (1024) that core drains. When it is full,
-    `server.broadcast` raises a Lua error instead of blocking.
-  - Events so far: `player_join`, with a read-only `{ name, uuid }` table. The UUID
-    is the persistent identity; the XUID is never exposed.
-  - Luau API: `server.on(event, handler)` (unknown event names are an error) and
-    `server.broadcast(message)` (Raw chat to every player; empty messages are an error).
-    The `server` table is read-only after sandboxing. Handlers live in the VM's
-    registry, so a reload drops the old ones with the old VM.
+    the calling API function raises a Lua error instead of blocking.
+  - Players are named by UUID string: the persistent identity. The XUID is never
+    exposed. Every table a handler receives is read-only.
   - Reload debouncing uses its own deadline, so a steady stream of events cannot
     postpone reloads.
-- **Hot reload (implemented):** a `notify` watcher on `plugins/` (non-recursive,
-  `*.luau`) debounced by 200 ms. Once a file stops changing, the plugin is reloaded into
-  a fresh VM, or unloaded if the file was deleted. A reload that fails logs the error
-  and keeps the running version. State-handoff hooks are not built yet.
+- **Events (implemented):**
+
+  | Event | Handler receives | When |
+  |---|---|---|
+  | `player_join` | the player, `{ name, uuid }` | 750 ms after the player spawns |
+  | `player_quit` | the player, `{ name, uuid }` | when the session of a player whose join plugins heard ends, however it ends |
+  | `player_chat` | `{ player, message, cancel(), is_cancelled() }` | before a chat message is relayed; `cancel()` stops it, and later handlers still run and can check |
+  | `block_break` | `{ player, position = { x, y, z }, block }` | after a player broke a block; `block` is the broken block's name |
+  | `block_place` | `{ player, position = { x, y, z }, block }` | after a player placed a block |
+
+  Block events report what already happened and cannot be cancelled yet.
+- **Luau API (implemented):**
+  - `server.on(event, handler)`: unknown event names are an error. Handlers live in
+    the VM's registry, so a reload drops the old ones with the old VM.
+  - `server.broadcast(message)`: System chat to every player.
+  - `server.send_message(player, message)`: System chat to one player in the world.
+  - `server.kick(player, reason?)`: disconnects a logged-in player with reason 55
+    (Kicked), showing `reason` or "You were kicked from the server.". Core delivers
+    it through the same per-UUID channel as the duplicate-login kick.
+  - `player` is a player table from an event or a UUID string. Empty messages and
+    anything else as `player` are Lua errors; unknown or offline players are ignored.
+  - The `server` table is read-only after sandboxing.
+- **Plugin folders and manifests (implemented)** in `mistvale_plugins::manifest`. Each
+  plugin is a folder in `plugins/` holding a `plugin.json`:
+
+  ```json
+  {
+    "name": "hello",
+    "description": "Welcomes players",
+    "version": "1.1.0",
+    "author": "Mistvale",
+    "main": "main.luau"
+  }
+  ```
+
+  - All five fields are required and unknown fields are refused, so typos surface.
+  - `name` is 1–64 letters, digits, `-` and `_`, and unique: a second folder with the
+    same name is not loaded. Logs and the VM use the name, not the folder.
+  - `main` is a `.luau` path inside the folder (no `..`, not absolute).
+  - A folder without `plugin.json` and loose `*.luau` files in `plugins/` are skipped
+    with a warning, once each.
+- **Hot reload (implemented):** a recursive `notify` watcher on `plugins/`, debounced by
+  200 ms. Once changes settle, the host rescans every folder: a plugin whose manifest
+  or entry script changed is reloaded into a fresh VM, and one whose folder or manifest
+  is gone is unloaded. A reload that fails, including an invalid manifest, logs the
+  error and keeps the running version. State-handoff hooks are not built yet.
 - **Luau (default, implemented)** in `mistvale_plugins::{host, luau}`. `PluginHost::start`
   returns once every plugin has loaded, and a broken plugin never stops startup.
   Each VM is set up in this order:
@@ -855,17 +897,15 @@ Each step starts only after explicit confirmation.
 | 14 | World persistence: changed chunks saved as one compressed file each under `world/chunks/`, every 5 s from the tick loop and on shutdown; loaded the first time a chunk is used, generated otherwise | Builds survive a server restart | ✅ done 2026-09-26; builds survive restarts (commit `0fdbf88`) |
 | 15 | Player persistence and spawn: `players/<uuid>.json` (feet position and rotation) saved on leave, every 5 s and at shutdown, restored at login; new players spawn at (0, -60, 0); broadcasts logged under the `chat` target | Rejoining puts you where you left; new players start at 0, 0 | ✅ done 2026-09-26; position and view direction restore on rejoin |
 | 16 | Flying state saved and restored (UpdateAbilities answers StartFlying and StopFlying); storage behind the `WorldStorage` trait with chunk format v2 (palettes of block names and states; v1 still read); server broadcasts as System text | Leaving while flying, you rejoin in the air; old and new chunk files load | ✅ done 2026-09-26; flying, spawn and old chunk files all work (commit `e816e16`) |
-| 17 | Authentication: Login tokens verified (RS256 against the authorization service's published keys; issuer, audience and lifetime checked) before the login continues; the verified UUID is used everywhere; a second login for the same UUID kicks the older session (reason 43, "logged in from another location") | A signed-in client joins; a second device on the same account kicks the first; a forged token is refused | ✅ done 2026-09-26; a signed-in PC and Android client joined, and a second login on the same account showed the first "logged in from another location" |
+| 17 | Authentication: Login tokens verified (RS256 against the authorization service's published keys; issuer, audience and lifetime checked) before the login continues; the verified UUID is used everywhere; a second login for the same UUID kicks the older session (reason 43, "logged in from another location") | A signed-in client joins; a second device on the same account kicks the first; a forged token is refused | ✅ done 2026-09-26; a signed-in PC and Android client joined, and a second login on the same account showed the first "logged in from another location" (commit `3f53b65`) |
+| 18 | Plugin API: plugins in folders with a `plugin.json` manifest (name, description, version, author, main); events `player_quit`, `player_chat` (cancellable), `block_break`, `block_place`; actions `server.send_message(player, message)` and `server.kick(player, reason?)` | The sample plugin greets a player privately, blocks a filtered word, kicks on `!kickme`, logs block changes and announces leaving | ✅ done 2026-09-26; folders, manifests, every event and action, and hot reload all worked live |
 
 Later steps are proposed but not yet scheduled:
-- player auth (JWKS verification of the multiplayer token)
 - vanilla item and biome data (ItemRegistry, BiomeDefinitionList, CreativeContent)
 - real skins forwarded from each client's login data (persona pieces and tints included)
 - movement validation (speed and teleport checks) and server corrections
-- chunk streaming
-- more plugin events (chat, quit) and actions
+- cancellable block events (undoing the change on the client) and more plugin actions
 - the JS/TS and Python engines
-- persistence
 
 ## 7. Risks and open questions
 

@@ -1,6 +1,6 @@
-//! The plugin host: an engine thread plus a watcher that reloads changed files.
+//! The plugin host: an engine thread plus a watcher that reloads changed plugins.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,20 +9,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
-use tokio::sync::mpsc as tokio_mpsc;
+use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
 use crate::luau::{Limits, LuauEngine};
+use crate::manifest::{MANIFEST_FILE, PluginSource};
 use crate::{Action, Event, Output, tracing_output};
 
-/// Quiet period after the last change to a file before it is reloaded; editors
-/// often save in several steps.
+/// Quiet period after the last change in the plugin directory before plugins
+/// are reloaded; editors often save in several steps.
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
-const LUAU_EXTENSION: &str = "luau";
 
 /// Plugin host settings.
 #[derive(Debug, Clone)]
 pub struct PluginConfig {
-    /// Directory holding `*.luau` plugins; created if missing.
+    /// Directory holding one folder per plugin; created if missing.
     pub directory: PathBuf,
     /// Reload plugins when their files are saved, added or removed.
     pub hot_reload: bool,
@@ -44,7 +44,7 @@ impl Default for PluginConfig {
 }
 
 /// Errors starting a [`PluginHost`]. Individual plugins that fail to load are
-/// logged instead, so one broken script never stops the server.
+/// logged instead, so one broken plugin never stops the server.
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
     #[error("failed to create plugin directory {}: {source}", .path.display())]
@@ -62,8 +62,11 @@ pub enum PluginError {
 
 #[derive(Debug)]
 enum Command {
-    Changed(PathBuf),
-    Event(Event),
+    /// Something in the plugin directory changed.
+    Changed,
+    /// An event for the plugins; for a cancellable one, where to say whether
+    /// a plugin cancelled it.
+    Event(Event, Option<oneshot::Sender<bool>>),
     Shutdown,
 }
 
@@ -94,7 +97,22 @@ impl Dispatcher {
 
     /// Queues `event` for every plugin listening for it.
     pub fn dispatch(&self, event: Event) {
-        let _ = self.commands.send(Command::Event(event));
+        let _ = self.commands.send(Command::Event(event, None));
+    }
+
+    /// Delivers a cancellable `event` to every plugin listening for it and
+    /// resolves to whether one of them cancelled it. Without plugins, or if
+    /// they stop first, nothing cancels it.
+    pub async fn dispatch_cancellable(&self, event: Event) -> bool {
+        let (verdict, cancelled) = oneshot::channel();
+        if self
+            .commands
+            .send(Command::Event(event, Some(verdict)))
+            .is_err()
+        {
+            return false;
+        }
+        cancelled.await.unwrap_or(false)
     }
 }
 
@@ -165,8 +183,8 @@ impl Drop for PluginHost {
     }
 }
 
-/// The engine thread: loads everything once, then delivers events and applies
-/// debounced file changes.
+/// The engine thread: loads everything once, then delivers events and
+/// rescans the plugin directory after changes settle.
 fn run(
     config: PluginConfig,
     output: Output,
@@ -178,101 +196,178 @@ fn run(
         memory: config.memory_limit,
         execution: config.execution_limit,
     };
-    let mut engine = LuauEngine::new(limits, output, actions);
-    for path in plugin_files(&config.directory) {
-        load(&mut engine, &path);
-    }
-    let _ = ready.send(engine.names());
+    let mut plugins = Plugins {
+        directory: config.directory,
+        engine: LuauEngine::new(limits, output, actions),
+        running: BTreeMap::new(),
+        warned: HashSet::new(),
+    };
+    plugins.scan();
+    let _ = ready.send(plugins.engine.names());
 
-    let mut changed: BTreeSet<PathBuf> = BTreeSet::new();
-    // When to reload `changed`; each change pushes it back, events do not.
-    let mut reload_at: Option<Instant> = None;
+    // When to rescan; each change pushes it back, events do not.
+    let mut rescan_at: Option<Instant> = None;
     loop {
-        let command = match reload_at {
+        let command = match rescan_at {
             None => commands.recv().ok(),
             Some(at) => match commands.recv_timeout(at.saturating_duration_since(Instant::now())) {
                 Ok(command) => Some(command),
                 Err(RecvTimeoutError::Timeout) => {
-                    for path in std::mem::take(&mut changed) {
-                        sync(&mut engine, &path);
-                    }
-                    reload_at = None;
+                    plugins.scan();
+                    rescan_at = None;
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => None,
             },
         };
         match command {
-            // Watcher paths may be absolute; name files relative to the configured directory.
-            Some(Command::Changed(path)) => {
-                if let Some(file_name) = path.file_name() {
-                    changed.insert(config.directory.join(file_name));
-                    reload_at = Some(Instant::now() + RELOAD_DEBOUNCE);
+            Some(Command::Changed) => rescan_at = Some(Instant::now() + RELOAD_DEBOUNCE),
+            Some(Command::Event(event, verdict)) => {
+                let cancelled = plugins.engine.dispatch(&event);
+                if let Some(verdict) = verdict {
+                    let _ = verdict.send(cancelled);
                 }
             }
-            Some(Command::Event(event)) => engine.dispatch(&event),
             Some(Command::Shutdown) | None => break,
         }
     }
 }
 
-/// Loads, reloads or unloads the plugin at `path` to match the file on disk.
-fn sync(engine: &mut LuauEngine, path: &Path) {
-    if path.is_file() {
-        load(engine, path);
-    } else if let Some(name) = plugin_name(path)
-        && engine.unload(&name)
-    {
-        tracing::info!(plugin = %name, "unloaded plugin");
-    }
+/// The plugins found in the plugin directory and what is running of them.
+struct Plugins {
+    directory: PathBuf,
+    engine: LuauEngine,
+    /// What each plugin folder is running, by folder.
+    running: BTreeMap<PathBuf, PluginSource>,
+    /// Stray files already warned about, so each is mentioned once.
+    warned: HashSet<PathBuf>,
 }
 
-fn load(engine: &mut LuauEngine, path: &Path) {
-    let Some(name) = plugin_name(path) else {
-        return;
-    };
-    let source = match fs::read_to_string(path) {
-        Ok(source) => source,
-        Err(err) => {
-            tracing::error!(plugin = %name, path = %path.display(), %err, "failed to read plugin");
+impl Plugins {
+    /// Brings the running plugins in line with the plugin folders on disk:
+    /// loads new ones, reloads changed ones and unloads removed ones.
+    fn scan(&mut self) {
+        let folders = self.folders();
+        let gone: Vec<PathBuf> = self
+            .running
+            .keys()
+            .filter(|folder| !folders.contains(folder))
+            .cloned()
+            .collect();
+        for folder in gone {
+            self.unload(&folder);
+        }
+        for folder in folders {
+            match PluginSource::read(&folder) {
+                Ok(Some(plugin)) => self.load(&folder, plugin),
+                // A folder without a manifest is not (or no longer) a plugin.
+                Ok(None) => {
+                    if self.running.contains_key(&folder) {
+                        self.unload(&folder);
+                    } else if self.warned.insert(folder.clone()) {
+                        tracing::warn!(
+                            folder = %folder.display(),
+                            "ignoring a plugin folder without a {MANIFEST_FILE}"
+                        );
+                    }
+                }
+                Err(err) => match self.running.get(&folder) {
+                    Some(running) => tracing::error!(
+                        plugin = %running.manifest.name,
+                        "failed to reload plugin, keeping the running version: {err}"
+                    ),
+                    None => tracing::error!(
+                        folder = %folder.display(),
+                        "failed to load plugin: {err}"
+                    ),
+                },
+            }
+        }
+    }
+
+    /// Runs `plugin` for `folder`, unless it is what already runs there.
+    fn load(&mut self, folder: &Path, plugin: PluginSource) {
+        let previous = self.running.get(folder);
+        if previous == Some(&plugin) {
             return;
         }
-    };
-    let was_running = engine.names().contains(&name);
-    match engine.load(&name, &path.display().to_string(), &source) {
-        Ok(true) => tracing::info!(plugin = %name, "reloaded plugin"),
-        Ok(false) => tracing::info!(plugin = %name, path = %path.display(), "loaded plugin"),
-        Err(err) if was_running => {
-            tracing::error!(plugin = %name, "failed to reload plugin, keeping the running version: {err}");
+        let name = plugin.manifest.name.clone();
+        if let Some((other, _)) = self
+            .running
+            .iter()
+            .find(|(other, running)| *other != folder && running.manifest.name == name)
+        {
+            tracing::error!(
+                plugin = %name,
+                folder = %folder.display(),
+                other = %other.display(),
+                "not loading a plugin with the same name as another"
+            );
+            return;
         }
-        Err(err) => tracing::error!(plugin = %name, "failed to load plugin: {err}"),
+        let renamed_from = previous
+            .map(|running| running.manifest.name.clone())
+            .filter(|previous| *previous != name);
+        let chunk_name = plugin.main_path.display().to_string();
+        match self.engine.load(&name, &chunk_name, &plugin.source) {
+            Ok(_) => {
+                if let Some(old) = renamed_from {
+                    self.engine.unload(&old);
+                }
+                let manifest = &plugin.manifest;
+                tracing::info!(
+                    plugin = %name,
+                    version = %manifest.version,
+                    author = %manifest.author,
+                    "{} plugin: {}",
+                    if previous.is_some() { "reloaded" } else { "loaded" },
+                    manifest.description
+                );
+                self.running.insert(folder.to_owned(), plugin);
+            }
+            Err(err) if previous.is_some() => tracing::error!(
+                plugin = %name,
+                "failed to reload plugin, keeping the running version: {err}"
+            ),
+            Err(err) => tracing::error!(plugin = %name, "failed to load plugin: {err}"),
+        }
     }
-}
 
-/// `*.luau` files directly inside `directory`, in name order.
-fn plugin_files(directory: &Path) -> Vec<PathBuf> {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
-        Err(err) => {
-            tracing::error!(directory = %directory.display(), %err, "failed to list plugins");
-            return Vec::new();
+    fn unload(&mut self, folder: &Path) {
+        if let Some(plugin) = self.running.remove(folder) {
+            self.engine.unload(&plugin.manifest.name);
+            tracing::info!(plugin = %plugin.manifest.name, "unloaded plugin");
         }
-    };
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| is_plugin_file(path) && path.is_file())
-        .collect();
-    files.sort();
-    files
-}
+    }
 
-fn is_plugin_file(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case(LUAU_EXTENSION))
-}
-
-fn plugin_name(path: &Path) -> Option<String> {
-    path.file_stem()?.to_str().map(str::to_owned)
+    /// The folders directly inside the plugin directory, in name order. Loose
+    /// scripts from before plugins had folders are pointed out once.
+    fn folders(&mut self) -> Vec<PathBuf> {
+        let entries = match fs::read_dir(&self.directory) {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::error!(directory = %self.directory.display(), %err, "failed to list plugins");
+                return Vec::new();
+            }
+        };
+        let mut folders = Vec::new();
+        for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
+            if path.is_dir() {
+                folders.push(path);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("luau"))
+                && self.warned.insert(path.clone())
+            {
+                tracing::warn!(
+                    file = %path.display(),
+                    "ignoring a loose script: plugins live in their own folder with a {MANIFEST_FILE}"
+                );
+            }
+        }
+        folders.sort();
+        folders
+    }
 }
 
 fn watch(
@@ -290,16 +385,14 @@ fn watch(
                     event.kind,
                     EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
                 ) {
-                    for path in event.paths.into_iter().filter(|path| is_plugin_file(path)) {
-                        let _ = commands.send(Command::Changed(path));
-                    }
+                    let _ = commands.send(Command::Changed);
                 }
             }
             Err(err) => tracing::warn!(%err, "plugin file watcher error"),
         })
         .map_err(watch_error)?;
     watcher
-        .watch(directory, RecursiveMode::NonRecursive)
+        .watch(directory, RecursiveMode::Recursive)
         .map_err(watch_error)?;
     Ok(watcher)
 }
@@ -311,15 +404,45 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn loads_at_startup_and_reloads_saved_files() {
+    /// A fresh, empty plugin directory for one test.
+    fn plugin_directory(test: &str) -> PathBuf {
         let directory =
-            std::env::temp_dir().join(format!("mistvale-plugins-{}", std::process::id()));
+            std::env::temp_dir().join(format!("mistvale-{test}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();
-        let plugin = directory.join("greet.luau");
-        fs::write(&plugin, r#"print("v1")"#).unwrap();
-        fs::write(directory.join("notes.txt"), "not a plugin").unwrap();
+        directory
+    }
+
+    /// Writes a plugin folder with a manifest naming `name` and `main.luau`.
+    fn write_plugin(directory: &Path, folder: &str, name: &str, source: &str) {
+        let folder = directory.join(folder);
+        fs::create_dir_all(&folder).unwrap();
+        let manifest = serde_json::json!({
+            "name": name,
+            "description": "A test plugin",
+            "version": "1.0.0",
+            "author": "Tester",
+            "main": "main.luau",
+        });
+        fs::write(folder.join(MANIFEST_FILE), manifest.to_string()).unwrap();
+        fs::write(folder.join("main.luau"), source).unwrap();
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn loads_plugin_folders_and_reloads_saved_scripts() {
+        let directory = plugin_directory("plugins");
+        write_plugin(&directory, "greet", "greeter", r#"print("v1")"#);
+        write_plugin(&directory, "twin", "greeter", r#"print("twin")"#);
+        fs::create_dir_all(directory.join("empty")).unwrap();
+        fs::write(directory.join("loose.luau"), r#"print("loose")"#).unwrap();
 
         let messages = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&messages);
@@ -332,15 +455,15 @@ mod tests {
         };
         let (actions, _) = tokio_mpsc::channel(1);
         let host = PluginHost::with_output(config, output, actions).unwrap();
-        assert_eq!(host.loaded(), ["greet"]);
-        assert_eq!(*messages.lock().unwrap(), ["greet: v1"]);
+        // The folder without a manifest, the loose script and the second
+        // plugin claiming the same name are all skipped.
+        assert_eq!(host.loaded(), ["greeter"]);
+        assert_eq!(*messages.lock().unwrap(), ["greeter: v1"]);
 
-        fs::write(&plugin, r#"print("v2")"#).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !messages.lock().unwrap().contains(&"greet: v2".to_owned()) {
-            assert!(Instant::now() < deadline, "plugin was not reloaded");
-            thread::sleep(Duration::from_millis(20));
-        }
+        fs::write(directory.join("greet").join("main.luau"), r#"print("v2")"#).unwrap();
+        wait_until("the plugin was not reloaded", || {
+            messages.lock().unwrap().contains(&"greeter: v2".to_owned())
+        });
 
         drop(host);
         fs::remove_dir_all(&directory).unwrap();
@@ -348,15 +471,13 @@ mod tests {
 
     #[test]
     fn events_reach_plugins_and_their_actions_reach_the_server() {
-        let directory =
-            std::env::temp_dir().join(format!("mistvale-events-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).unwrap();
-        fs::write(
-            directory.join("welcome.luau"),
+        let directory = plugin_directory("events");
+        write_plugin(
+            &directory,
+            "welcome",
+            "welcome",
             r#"server.on("player_join", function(player) server.broadcast("hi " .. player.name) end)"#,
-        )
-        .unwrap();
+        );
 
         let config = PluginConfig {
             directory: directory.clone(),
@@ -370,17 +491,53 @@ mod tests {
             uuid: "174319cc-f69f-30d8-a279-6ace57f2011e".into(),
         }));
 
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let action = loop {
-            if let Ok(action) = received.try_recv() {
-                break action;
-            }
-            assert!(Instant::now() < deadline, "the plugin did not broadcast");
-            thread::sleep(Duration::from_millis(10));
-        };
-        assert_eq!(action, Action::Broadcast("hi Steve".into()));
+        let mut action = None;
+        wait_until("the plugin did not broadcast", || {
+            action = received.try_recv().ok();
+            action.is_some()
+        });
+        assert_eq!(action, Some(Action::Broadcast("hi Steve".into())));
 
         drop(host);
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn plugins_can_cancel_chat() {
+        let directory = plugin_directory("cancel");
+        write_plugin(
+            &directory,
+            "filter",
+            "filter",
+            r#"
+                server.on("player_chat", function(event)
+                    if event.message:find("badword") then event.cancel() end
+                end)
+            "#,
+        );
+        let config = PluginConfig {
+            directory: directory.clone(),
+            hot_reload: false,
+            ..PluginConfig::default()
+        };
+        let (actions, _) = tokio_mpsc::channel(4);
+        let host = PluginHost::with_output(config, Arc::new(|_, _, _| {}), actions).unwrap();
+        let chat = |message: &str| Event::PlayerChat {
+            player: crate::Player {
+                name: "Steve".into(),
+                uuid: "174319cc-f69f-30d8-a279-6ace57f2011e".into(),
+            },
+            message: message.into(),
+        };
+        let dispatcher = host.dispatcher();
+        assert!(dispatcher.dispatch_cancellable(chat("a badword")).await);
+        assert!(!dispatcher.dispatch_cancellable(chat("hello")).await);
+
+        drop(host);
+        assert!(
+            !dispatcher.dispatch_cancellable(chat("a badword")).await,
+            "with the plugins gone, nothing cancels"
+        );
         fs::remove_dir_all(&directory).unwrap();
     }
 }

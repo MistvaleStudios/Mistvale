@@ -198,6 +198,14 @@ impl World {
         self.air
     }
 
+    /// The name of the block with network ID `block`, e.g. `minecraft:stone`,
+    /// or `minecraft:unknown` for a block the world does not know.
+    pub fn block_name(&self, block: u32) -> &str {
+        self.known
+            .get(&block)
+            .map_or("minecraft:unknown", |state| state.name.as_str())
+    }
+
     /// The network ID of the block at `pos`; air outside the world's height.
     pub fn block(&self, pos: BlockPos) -> u32 {
         let Some((sub_chunk, x, y, z)) = locate(pos) else {

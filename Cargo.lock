@@ -2577,6 +2577,8 @@ dependencies = [
  "mlua",
  "notify",
  "rustpython-vm",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

@@ -1,15 +1,24 @@
 //! One session per player: a verified login with a UUID that is already
-//! connected kicks the older session, as vanilla does.
+//! connected kicks the older session, as vanilla does. Plugins kick players
+//! through the same registry.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use mistvale_protocol::packets::DisconnectReason;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-/// Tells a session to disconnect its player with a message.
-pub type Kick = mpsc::Sender<String>;
+/// Why a session must disconnect its player, and what the player is shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KickNotice {
+    pub reason: DisconnectReason,
+    pub message: String,
+}
+
+/// Tells a session to disconnect its player.
+pub type Kick = mpsc::Sender<KickNotice>;
 
 /// The message a session kicked by a newer login shows.
 pub const LOGGED_IN_ELSEWHERE: &str = "You logged in from another location.";
@@ -32,7 +41,10 @@ impl Logins {
         let id = self.last_id.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some((_, older)) = self.active().insert(uuid, (id, kick)) {
             tracing::info!(%uuid, "the player logged in again; kicking the older session");
-            let _ = older.try_send(LOGGED_IN_ELSEWHERE.to_owned());
+            let _ = older.try_send(KickNotice {
+                reason: DisconnectReason::LOGGED_IN_OTHER_LOCATION,
+                message: LOGGED_IN_ELSEWHERE.to_owned(),
+            });
         }
         LoginClaim {
             logins: self,
@@ -43,6 +55,19 @@ impl Logins {
 
     pub fn is_logged_in(&self, uuid: Uuid) -> bool {
         self.active().contains_key(&uuid)
+    }
+
+    /// Disconnects the player logged in as `uuid`, showing them `message`.
+    /// Returns whether they were logged in.
+    pub fn kick(&self, uuid: Uuid, message: String) -> bool {
+        let Some((_, kick)) = self.active().get(&uuid).cloned() else {
+            return false;
+        };
+        let _ = kick.try_send(KickNotice {
+            reason: DisconnectReason::KICKED,
+            message,
+        });
+        true
     }
 
     fn active(&self) -> MutexGuard<'_, HashMap<Uuid, (u64, Kick)>> {
@@ -83,7 +108,9 @@ mod tests {
         let first_claim = logins.claim(uuid, first_kick);
         assert!(first.try_recv().is_err());
         let second_claim = logins.claim(uuid, second_kick);
-        assert_eq!(first.try_recv().unwrap(), LOGGED_IN_ELSEWHERE);
+        let notice = first.try_recv().unwrap();
+        assert_eq!(notice.reason, DisconnectReason::LOGGED_IN_OTHER_LOCATION);
+        assert_eq!(notice.message, LOGGED_IN_ELSEWHERE);
         assert!(second.try_recv().is_err(), "the newer session stays");
 
         // The kicked session leaving does not release the newer one's claim.
@@ -91,6 +118,24 @@ mod tests {
         assert!(logins.is_logged_in(uuid));
         drop(second_claim);
         assert!(!logins.is_logged_in(uuid));
+    }
+
+    #[test]
+    fn logged_in_players_can_be_kicked() {
+        let logins = Logins::new();
+        let uuid = Uuid::new_v4();
+        assert!(!logins.kick(uuid, "bye".into()), "not logged in");
+
+        let (kick, mut kicks) = mpsc::channel(1);
+        let _claim = logins.claim(uuid, kick);
+        assert!(logins.kick(uuid, "bye".into()));
+        assert_eq!(
+            kicks.try_recv().unwrap(),
+            KickNotice {
+                reason: DisconnectReason::KICKED,
+                message: "bye".into()
+            }
+        );
     }
 
     #[test]

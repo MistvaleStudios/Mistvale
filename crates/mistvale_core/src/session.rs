@@ -15,7 +15,9 @@
 //! 6. SetLocalPlayerAsInitialized: the player is in the world. They join the
 //!    [`Players`](crate::players::Players) and plugins hear `player_join`.
 //!
-//! From then on, chat messages (Text) are relayed to every player.
+//! From then on, chat messages (Text) are relayed to every player unless a
+//! plugin cancels them, and plugins hear of blocks broken and placed. Plugins
+//! that heard `player_join` hear `player_quit` when the session ends.
 
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -24,7 +26,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use mistvale_net::{ClientIdentity, Connection, Reliability};
-use mistvale_plugins::{Event, Player};
+use mistvale_plugins::{BlockChange, Dispatcher, Event, Player, Position};
 use mistvale_protocol::batch::{self, BatchError, Compression, CompressionAlgorithm};
 use mistvale_protocol::io::DecodeError;
 use mistvale_protocol::login::{ConnectionRequest, IdentityClaims, LoginError};
@@ -47,6 +49,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthError;
 use crate::inventory;
+use crate::logins::KickNotice;
 use crate::players::{
     EYE_HEIGHT, Joining, Movement, OUTBOUND_QUEUE, Profile, STANDING_HEIGHT, View, body_overlaps,
     player_metadata,
@@ -80,6 +83,10 @@ const MAX_CHAT_LENGTH: usize = 512;
 /// they send arrive once the client's HUD is ready.
 const JOIN_EVENT_DELAY: Duration = Duration::from_millis(750);
 
+/// Longest a chat message waits for plugins to decide whether to cancel it.
+/// Past that it is sent anyway: a stuck plugin must not silence chat.
+const CHAT_VERDICT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Serves one client until either side closes the connection.
 pub async fn run(mut connection: Connection, server: Arc<Server>) {
     let entity_id = server.players.allocate_entity_id();
@@ -108,9 +115,16 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
     // The plugin join event, waiting out [`JOIN_EVENT_DELAY`].
     let mut join_event: Option<(Pin<Box<tokio::time::Sleep>>, Player)> = None;
     // Set once the player's identity is verified: the one session for that
-    // UUID. A newer login for the same player sends a kick.
-    let (kick, mut kicks) = mpsc::channel::<String>(1);
+    // UUID. A newer login for the same player, or a plugin, sends a kick.
+    let (kick, mut kicks) = mpsc::channel::<KickNotice>(1);
     let mut login_claim = None;
+    // The player as plugins know them, once they are in the world.
+    let mut plugin_player: Option<Player> = None;
+    // However the session ends, plugins that heard of the join hear of the quit.
+    let mut quit_event = QuitEvent {
+        plugins: &server.plugins,
+        player: None,
+    };
 
     loop {
         tokio::select! {
@@ -160,6 +174,7 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                                     name: profile.name.clone(),
                                     uuid: profile.uuid.to_string(),
                                 };
+                                plugin_player = Some(player.clone());
                                 // Join first, so plugins greeting the player reach them too.
                                 membership = Some(server.players.join(Joining {
                                     entity_id,
@@ -187,12 +202,24 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                                 }
                             }
                             SessionEvent::BrokeBlock(pos) => {
-                                server.break_block(pos);
+                                if let Some(broken) = server.break_block(pos)
+                                    && let Some(player) = &plugin_player
+                                {
+                                    server.plugins.dispatch(Event::BlockBreak(
+                                        block_change(server, player, pos, broken),
+                                    ));
+                                }
                             }
                             SessionEvent::PlacedBlock { pos, block } => {
-                                // Someone may have filled the spot since it
-                                // was checked; undo the client's prediction.
-                                if !server.place_block(pos, block) {
+                                if server.place_block(pos, block) {
+                                    if let Some(player) = &plugin_player {
+                                        server.plugins.dispatch(Event::BlockPlace(
+                                            block_change(server, player, pos, block),
+                                        ));
+                                    }
+                                } else {
+                                    // Someone may have filled the spot since it
+                                    // was checked; undo the client's prediction.
                                     let _ = outbound.try_send(server::block_update(pos, server.world.block(pos)));
                                 }
                             }
@@ -212,7 +239,15 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                                 }
                             }
                             SessionEvent::Chat(message) => {
-                                server.players.chat(session.player(), &message);
+                                let cancelled = match &plugin_player {
+                                    Some(player) => chat_cancelled(&server.plugins, player, &message).await,
+                                    None => false,
+                                };
+                                if cancelled {
+                                    tracing::info!(target: "chat", "[cancelled by a plugin] <{}> {message}", session.player());
+                                } else {
+                                    server.players.chat(session.player(), &message);
+                                }
                             }
                         }
                     }
@@ -223,9 +258,9 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                     }
                 }
             }
-            Some(message) = kicks.recv() => {
-                // A newer login for this player: this session gives way.
-                let reply = Reply::disconnect(DisconnectReason::LOGGED_IN_OTHER_LOCATION, message);
+            Some(notice) = kicks.recv() => {
+                // A newer login for this player, or a plugin: this session ends.
+                let reply = Reply::disconnect(notice.reason, notice.message);
                 let _ = send(connection, reply.packets.iter().map(Vec::as_slice), compression).await;
                 drop(membership.take());
                 drop(login_claim.take());
@@ -234,6 +269,7 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
             }
             () = async { join_event.as_mut().expect("guarded").0.as_mut().await }, if join_event.is_some() => {
                 let (_, player) = join_event.take().expect("guarded");
+                quit_event.player = Some(player.clone());
                 server.plugins.dispatch(Event::PlayerJoin(player));
             }
             Some(packet) = queued.recv() => {
@@ -247,6 +283,49 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                 }
             }
         }
+    }
+}
+
+/// Tells plugins a player left when dropped, if they heard of the join.
+struct QuitEvent<'a> {
+    plugins: &'a Dispatcher,
+    player: Option<Player>,
+}
+
+impl Drop for QuitEvent<'_> {
+    fn drop(&mut self) {
+        if let Some(player) = self.player.take() {
+            self.plugins.dispatch(Event::PlayerQuit(player));
+        }
+    }
+}
+
+/// Asks plugins whether to cancel a chat message; a message they take too
+/// long over is sent.
+async fn chat_cancelled(plugins: &Dispatcher, player: &Player, message: &str) -> bool {
+    let event = Event::PlayerChat {
+        player: player.clone(),
+        message: message.to_owned(),
+    };
+    match tokio::time::timeout(CHAT_VERDICT_TIMEOUT, plugins.dispatch_cancellable(event)).await {
+        Ok(cancelled) => cancelled,
+        Err(_) => {
+            tracing::warn!(player = %player.name, "plugins took too long over a chat message; sending it");
+            false
+        }
+    }
+}
+
+/// A block `player` changed at `pos`, as plugins see it.
+fn block_change(server: &Server, player: &Player, pos: BlockPos, block: u32) -> BlockChange {
+    BlockChange {
+        player: player.clone(),
+        position: Position {
+            x: pos.x,
+            y: pos.y,
+            z: pos.z,
+        },
+        block: server.world.block_name(block).to_owned(),
     }
 }
 
