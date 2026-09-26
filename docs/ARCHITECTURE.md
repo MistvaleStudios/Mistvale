@@ -625,8 +625,8 @@ DTLS, SCTP, and multi-segment messages both ways.
   - Streaming happens in the session as input arrives, not in the tick loop. Chunks
     come from `FlatWorld`, so no generation cost is involved yet.
 - **World (mutable, implemented):** `world::World` is an endless superflat overworld with
-  vanilla's default layers (bedrock at y = -64, two dirt, grass at -61) in plains. The
-  spawn is (8, -60, 8).
+  vanilla's default layers (bedrock at y = -64, two dirt, grass at -61) in plains. New
+  players spawn at (0, -60, 0), centred on the block.
   - Unchanged columns all share one generated column and its encoded payload.
   - The first change to a column copies it into a map of changed columns behind a
     mutex. Each changed column keeps its sub-chunk storages and a cached payload, which
@@ -679,13 +679,25 @@ DTLS, SCTP, and multi-segment messages both ways.
     themselves, which Mojang's docs say the client expects.
   - AddPlayer carries the current sneaking state.
 
-- **Persistence (implemented):** `World::open(dir)` (the binary uses `MISTVALE_WORLD_DIR`,
-  default `world`, which is git-ignored) keeps changed chunks on disk; `World::new` stays
-  in memory, for tests.
-  - `storage::ChunkStore` writes one file per changed column, `chunks/c.<x>.<z>.bin`: the
-    magic `MVCH`, a version byte, then zlib data. That data is the sub-chunk count, and
-    for each sub-chunk a presence byte plus 4096 little-endian u32 block network IDs.
-    Uniform sub-chunks compress to a few hundred bytes.
+- **Persistence (implemented):** the world talks to storage only through the
+  `storage::WorldStorage` trait. It lists saved chunks, loads and saves a chunk column,
+  and loads and saves a player. `World::with_storage` takes any backend. `World::open(dir)`
+  uses `BinStorage`, Mistvale's own format; the binary reads the directory from
+  `MISTVALE_WORLD_DIR` (default `world`, which is git-ignored). `World::new` stays in
+  memory, for tests.
+  - **Blocks cross the trait by name**, as a palette of block states (name and states)
+    plus 4096 indices per sub-chunk, the way vanilla worlds store them. So a LevelDB
+    backend needs no knowledge of network IDs.
+  - The world maps its network IDs (state hashes) back to names through a table of every
+    block it can hold: air, the superflat layers and the hotbar blocks.
+  - A block with no known name is stored as a raw placeholder,
+    `mistvale:raw_network_id` with its ID as a state, so nothing is lost.
+  - `BinStorage` writes one file per changed column, `chunks/c.<x>.<z>.bin`: the magic
+    `MVCH`, a version byte, then zlib data. Format **version 2**, written now, stores per
+    sub-chunk a palette of names and states and u16 indices; `storage.rs` documents the
+    layout.
+  - **Version 1** files (u32 hashes per block) still load, as raw placeholders, and are
+    rewritten as version 2 the next time their chunk changes.
   - Writes go to a `.tmp` file that is renamed over the old one, so a crash never leaves
     half a chunk. There are no new dependencies: `flate2` was already in use, and SQLite
     (C) or `sled` (pre-1.0, dormant) were not needed for per-chunk blobs.
@@ -696,6 +708,21 @@ DTLS, SCTP, and multi-segment messages both ways.
     and once more when it stops (Ctrl+C). Columns are copied out under the lock and
     written after it is released, and a failed write stays dirty for the next save.
     Killing the process loses at most 5 s of changes.
+  - **Players:** `players/<uuid>.json` holds the feet position, pitch, yaw, head yaw and
+    whether the player was flying (`flying` defaults to false, so older files still
+    load).
+  - A player is saved when their session ends, however it ends; everyone online is also
+    saved on every world save (5 s) and at shutdown.
+  - At login the session loads the file, so StartGame, the first chunks and the entity
+    others see all start there. A file that cannot be read, or a position outside the
+    world's height, is ignored and the player starts at the spawn.
+  - **Flying:** the session follows StartFlying and StopFlying (input bits 42 and 43) and
+    answers each with UpdateAbilities, as Mojang's docs say the client expects. The
+    abilities sent at spawn and in those answers include the Flying value while the
+    player flies, so a player who left in the air stays in the air.
+- **Storage format and vanilla worlds (decided 2026-09-26):** keep the `.bin` format for
+  the MVP. The trait and the name-based palettes are in place; a LevelDB backend for
+  vanilla worlds comes later. The reasoning is in §7.
 
   Generation beyond superflat and entities are not started yet.
 
@@ -795,7 +822,9 @@ Each step starts only after explicit confirmation.
 | 11 | Mutable world and block breaking: `World` keeps changed columns; breaks from PlayerAuthInput block actions (StartBreak, PredictDestroyBlock) and PlayerAction (CreativeDestroyBlock), checked for height, reach and loaded chunk; UpdateBlock to every player with the chunk | Broken blocks stay broken, for everyone, and after walking away and back | ✅ done 2026-09-26; breaks persist and sync across clients (commit `e9ebff0`) |
 | 12 | Block placing and feedback: a hotbar of 9 vanilla blocks (a partial ItemRegistry with vanilla item IDs, InventoryContent at spawn), ClickBlock from InventoryTransaction placed against the clicked face (reach, air, not inside the placer; refusals undone with UpdateBlock), UpdateBlock plus the `place` sound; break particles (LevelEvent 2001); arm swings (Animate); sneaking (SetActorData) | Blocks can be placed and everyone sees and hears building; swings and crouching show | ✅ done 2026-09-26; hotbar, placing, particles, sounds, swings and sneaking work (commit `c3a895b`) |
 | 13 | Placement never overlaps a player: every online player's box is checked, and refusals are rolled back | A block cannot be placed where another player stands | ✅ done 2026-09-26; blocks vanish when placed inside another player (commit `8e8e1c4`) |
-| 14 | World persistence: changed chunks saved as one compressed file each under `world/chunks/`, every 5 s from the tick loop and on shutdown; loaded the first time a chunk is used, generated otherwise | Builds survive a server restart | 🧪 ready for a live test (2026-09-26) |
+| 14 | World persistence: changed chunks saved as one compressed file each under `world/chunks/`, every 5 s from the tick loop and on shutdown; loaded the first time a chunk is used, generated otherwise | Builds survive a server restart | ✅ done 2026-09-26; builds survive restarts (commit `0fdbf88`) |
+| 15 | Player persistence and spawn: `players/<uuid>.json` (feet position and rotation) saved on leave, every 5 s and at shutdown, restored at login; new players spawn at (0, -60, 0); broadcasts logged under the `chat` target | Rejoining puts you where you left; new players start at 0, 0 | ✅ done 2026-09-26; position and view direction restore on rejoin |
+| 16 | Flying state saved and restored (UpdateAbilities answers StartFlying and StopFlying); storage behind the `WorldStorage` trait with chunk format v2 (palettes of block names and states; v1 still read); server broadcasts as System text | Leaving while flying, you rejoin in the air; old and new chunk files load | 🧪 ready for a live test (2026-09-26) |
 
 Later steps are proposed but not yet scheduled:
 - player auth (JWKS verification of the multiplayer token)
@@ -834,11 +863,30 @@ Later steps are proposed but not yet scheduled:
   the flag numbering question is settled: the bit numbers in Mojang's PlayerActionType
   descriptions match gophertunnel's input flags (StartSneaking is bit 27, MissedSwing
   bit 39). Mojang's enum just omits some entries.
-- **Saved chunks store block state hashes.** A hash changes if Mojang renames a block or
-  changes its states, which would turn saved blocks into unknown ones after an update.
-  Storing block names and states instead is the robust format, and the version byte
-  leaves room for it. Changed columns also stay in memory until shutdown; unloading is
-  not needed at this scale yet.
+- **Vanilla world compatibility.** Vanilla Bedrock worlds are LevelDB databases (Mojang's
+  fork, with raw-zlib compression), keyed by chunk, dimension and record type. Sub-chunks
+  are stored with little-endian NBT palettes of block names and states. Reading them
+  natively is the better end state, so owners can drop in a world, but most of the cost
+  is not the database:
+  - A pure-Rust LevelDB (`rusty-leveldb`, with a custom compressor) or C bindings to
+    Mojang's fork. Both are workable.
+  - Little-endian NBT *decoding*; Mistvale only encodes network NBT today.
+  - Upgrading old block states: older worlds use renamed or merged blocks (`stone` with
+    `stone_type`, and so on), which need Mojang's upgrade tables.
+  - Block entities, entities, biomes, and the level.dat and player records, or keeping
+    them intact when writing.
+
+  Palettes store names and states, and Mistvale's network IDs are hashes of exactly
+  those, so blocks themselves map cleanly. The plan is to move the `.bin` format to name
+  palettes first (it has a version byte), then add LevelDB as a second backend: first
+  read-only import, then native read and write.
+- **Saved chunks store block names (resolved 2026-09-26).** Version 1 stored state
+  hashes, which change when Mojang renames a block or changes its states. Version 2
+  stores names and states. A rename across versions will still need an upgrade table,
+  as for vanilla worlds, but a saved block can no longer silently become a different
+  one. Blocks outside the world's known table are kept as raw placeholders. Changed
+  columns still stay in memory until shutdown; unloading is not needed at this scale
+  yet.
 - **A partial ItemRegistry is untested with a live client.** Only nine items are
   registered, with vanilla's IDs, where vanilla sends about 1,900. An empty registry
   worked for spawning, but held items might not render or be usable. The hotbar blocks

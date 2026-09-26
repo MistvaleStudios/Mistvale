@@ -13,6 +13,8 @@ pub mod input_flag {
     pub const STOP_SNEAKING: i32 = 28;
     /// Swinging at nothing (left-clicking air).
     pub const MISSED_SWING: i32 = 39;
+    pub const START_FLYING: i32 = 42;
+    pub const STOP_FLYING: i32 = 43;
 }
 
 /// Most input flags a PlayerAuthInput may list; the protocol defines about 65.

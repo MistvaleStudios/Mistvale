@@ -19,6 +19,8 @@ use mistvale_protocol::types::{BlockPos, ChunkPos, Vec3};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use uuid::Uuid;
 
+use crate::storage::SavedPlayer;
+
 /// Packets that may wait for one player before more are dropped.
 pub const OUTBOUND_QUEUE: usize = 256;
 
@@ -60,6 +62,35 @@ impl Movement {
     pub fn chunk(&self) -> ChunkPos {
         ChunkPos::of_block(BlockPos::containing(self.feet()))
     }
+
+    /// What is saved for the player: feet position, rotation and flying.
+    pub fn saved(&self, flying: bool) -> SavedPlayer {
+        let feet = self.feet();
+        SavedPlayer {
+            x: feet.x,
+            y: feet.y,
+            z: feet.z,
+            pitch: self.pitch,
+            yaw: self.yaw,
+            head_yaw: self.head_yaw,
+            flying,
+        }
+    }
+
+    /// Where a returning player starts: where they left.
+    pub fn from_saved(saved: &SavedPlayer) -> Self {
+        Self {
+            position: Vec3 {
+                x: saved.x,
+                y: saved.y + EYE_HEIGHT,
+                z: saved.z,
+            },
+            pitch: saved.pitch,
+            yaw: saved.yaw,
+            head_yaw: saved.head_yaw,
+            on_ground: true,
+        }
+    }
 }
 
 /// The chunks a player's client shows: a circle of `radius` chunks around `centre`.
@@ -93,6 +124,8 @@ struct Online {
     moved: bool,
     view: View,
     sneaking: bool,
+    /// Whether the player is flying, as their client last said.
+    flying: bool,
     /// Players whose entity this player's client has, by entity ID.
     seen: HashSet<u64>,
     outbound: Outbound,
@@ -140,6 +173,7 @@ impl Players {
             moved: false,
             view,
             sneaking: false,
+            flying: false,
             seen: HashSet::new(),
             outbound,
         };
@@ -168,6 +202,14 @@ impl Players {
 
     pub fn count(&self) -> usize {
         self.online().len()
+    }
+
+    /// Everyone online, as they would be saved.
+    pub fn saved(&self) -> Vec<(Uuid, SavedPlayer)> {
+        self.online()
+            .values()
+            .map(|player| (player.profile.uuid, player.movement.saved(player.flying)))
+            .collect()
     }
 
     /// Updates who sees whom, then sends everyone who moved to the players
@@ -263,21 +305,27 @@ impl Players {
         }
     }
 
-    /// Shows `message` in every player's chat.
+    /// Shows a message from the server (a plugin announcement, say) in every
+    /// player's chat, as a system message.
     pub fn broadcast_message(&self, message: &str) {
-        if message.is_empty() || message.len() > Text::MAX_MESSAGE_LEN {
+        self.broadcast_text(Text::system(message));
+    }
+
+    /// Relays a player's chat message to everyone, including its author, as
+    /// plain text.
+    pub fn chat(&self, from: &str, message: &str) {
+        self.broadcast_text(Text::raw(format!("<{from}> {message}")));
+    }
+
+    fn broadcast_text(&self, text: Text) {
+        if text.message.is_empty() || text.message.len() > Text::MAX_MESSAGE_LEN {
             tracing::warn!(
-                len = message.len(),
+                len = text.message.len(),
                 "not broadcasting a message that is empty or too long"
             );
             return;
         }
-        self.broadcast(&encode(&Text::raw(message)));
-    }
-
-    /// Relays a player's chat message to everyone, including its author.
-    pub fn chat(&self, from: &str, message: &str) {
-        self.broadcast_message(&format!("<{from}> {message}"));
+        self.broadcast(&encode(&text));
     }
 
     fn online(&self) -> MutexGuard<'_, HashMap<u64, Online>> {
@@ -331,6 +379,13 @@ impl Membership<'_> {
             if *id == self.entity_id || other.seen.contains(&self.entity_id) {
                 other.send(packet.clone());
             }
+        }
+    }
+
+    /// Records whether the player is flying, for saving.
+    pub fn flying(&self, flying: bool) {
+        if let Some(player) = self.players.online().get_mut(&self.entity_id) {
+            player.flying = flying;
         }
     }
 
@@ -607,6 +662,25 @@ mod tests {
         steve.swing();
         assert_eq!(ids(&mut alex_queue), [id::ANIMATE]);
         assert!(ids(&mut steve_queue).is_empty());
+    }
+
+    #[test]
+    fn saved_players_keep_their_feet_and_rotation() {
+        let movement = Movement {
+            position: Vec3 {
+                x: 12.25,
+                y: -60.0 + EYE_HEIGHT,
+                z: -3.5,
+            },
+            pitch: 15.0,
+            yaw: 90.0,
+            head_yaw: 80.0,
+            on_ground: true,
+        };
+        let saved = movement.saved(false);
+        // Files hold the feet, as a person would read coordinates.
+        assert_eq!((saved.x, saved.y, saved.z), (12.25, -60.0, -3.5));
+        assert_eq!(Movement::from_saved(&saved), movement);
     }
 
     #[test]

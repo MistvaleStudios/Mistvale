@@ -2425,6 +2425,8 @@ dependencies = [
  "mistvale_net",
  "mistvale_plugins",
  "mistvale_protocol",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

@@ -17,6 +17,7 @@
 //!
 //! From then on, chat messages (Text) are relayed to every player.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,6 +50,7 @@ use crate::players::{
     player_metadata,
 };
 use crate::server::{self, Server};
+use crate::storage::SavedPlayer;
 use crate::view::ChunkView;
 use crate::world::{MAX_Y, MIN_Y, OVERWORLD, World};
 
@@ -72,20 +74,37 @@ const MAX_REACH: f32 = 12.0;
 /// Longest chat message relayed, in characters.
 const MAX_CHAT_LENGTH: usize = 512;
 
+/// How long after a player spawns plugins hear of it: 15 ticks, so messages
+/// they send arrive once the client's HUD is ready.
+const JOIN_EVENT_DELAY: Duration = Duration::from_millis(750);
+
 /// Serves one client until either side closes the connection.
 pub async fn run(mut connection: Connection, server: Arc<Server>) {
-    let network_id = connection.network_id();
     let entity_id = server.players.allocate_entity_id();
     let mut session = Session::new(
         connection.client_identity().cloned(),
         Arc::clone(&server.world),
         entity_id,
     );
+    serve(&mut connection, &server, &mut session).await;
+    // However the session ended, remember where the player left.
+    if let Some((uuid, player)) = session.saved_player() {
+        server.save_player(uuid, &player);
+    }
+}
+
+/// The session's packet loop, until the connection closes or the session
+/// ends it.
+async fn serve(connection: &mut Connection, server: &Server, session: &mut Session) {
+    let network_id = connection.network_id();
+    let entity_id = session.entity_id;
     let mut compression = None;
     // Packets other sessions and plugins send this player, e.g. chat.
     let (outbound, mut queued) = mpsc::channel::<Bytes>(OUTBOUND_QUEUE);
     // Set once the player is in the world; leaving the loop drops it.
     let mut membership = None;
+    // The plugin join event, waiting out [`JOIN_EVENT_DELAY`].
+    let mut join_event: Option<(Pin<Box<tokio::time::Sleep>>, Player)> = None;
 
     loop {
         tokio::select! {
@@ -107,7 +126,7 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
                 };
                 for reply in replies {
                     let packets = reply.packets.iter().map(Vec::as_slice);
-                    if !send(&connection, packets, compression).await {
+                    if !send(connection, packets, compression).await {
                         return;
                     }
                     if let Some(agreed) = reply.enable_compression {
@@ -128,7 +147,13 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
                                     view,
                                     outbound: outbound.clone(),
                                 }));
-                                server.plugins.dispatch(Event::PlayerJoin(player));
+                                // Plugins hear of the join a little later: the
+                                // client's HUD shows messages that arrive while
+                                // it is still starting up twice.
+                                join_event = Some((
+                                    Box::pin(tokio::time::sleep(JOIN_EVENT_DELAY)),
+                                    player,
+                                ));
                             }
                             SessionEvent::Moved(movement) => {
                                 if let Some(membership) = &membership {
@@ -160,6 +185,11 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
                                     membership.sneaking(sneaking);
                                 }
                             }
+                            SessionEvent::Flying(flying) => {
+                                if let Some(membership) = &membership {
+                                    membership.flying(flying);
+                                }
+                            }
                             SessionEvent::Chat(message) => {
                                 server.players.chat(session.player(), &message);
                             }
@@ -167,10 +197,14 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
                     }
                     if reply.close {
                         drop(membership.take());
-                        linger(&mut connection).await;
+                        linger(connection).await;
                         return;
                     }
                 }
+            }
+            () = async { join_event.as_mut().expect("guarded").0.as_mut().await }, if join_event.is_some() => {
+                let (_, player) = join_event.take().expect("guarded");
+                server.plugins.dispatch(Event::PlayerJoin(player));
             }
             Some(packet) = queued.recv() => {
                 // Send everything already waiting in one batch.
@@ -178,7 +212,7 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
                 while let Ok(packet) = queued.try_recv() {
                     packets.push(packet);
                 }
-                if !send(&connection, packets.iter().map(|packet| &packet[..]), compression).await {
+                if !send(connection, packets.iter().map(|packet| &packet[..]), compression).await {
                     return;
                 }
             }
@@ -249,6 +283,8 @@ pub enum SessionEvent {
     Swing,
     /// The player started or stopped sneaking.
     Sneaking(bool),
+    /// The player started or stopped flying.
+    Flying(bool),
     /// The player said something in chat.
     Chat(String),
 }
@@ -337,6 +373,8 @@ pub struct Session {
     entity_id: u64,
     /// The chunks around the player and those the client already has.
     view: ChunkView,
+    /// Whether the player is flying, as their client last said.
+    flying: bool,
     /// Where the player is, as last reported.
     movement: Movement,
     world: Arc<World>,
@@ -363,6 +401,7 @@ impl Session {
                 on_ground: true,
             },
             view: ChunkView::new(),
+            flying: false,
             world,
         }
     }
@@ -374,6 +413,12 @@ impl Session {
     /// The player's name, once logged in.
     pub fn player(&self) -> &str {
         &self.player
+    }
+
+    /// The player's UUID and what to save for them, once they have been in
+    /// the world; players who never finished spawning are not saved.
+    pub fn saved_player(&self) -> Option<(Uuid, SavedPlayer)> {
+        (self.stage == Stage::InGame).then(|| (self.uuid, self.movement.saved(self.flying)))
     }
 
     /// Handles one encoded packet (header and payload).
@@ -484,6 +529,12 @@ impl Session {
             tracing::debug!("login has no persistent identity; using a random UUID");
             Uuid::new_v4()
         });
+        // Returning players start where they left.
+        if let Some(saved) = self.world.load_player(self.uuid) {
+            self.movement = Movement::from_saved(&saved);
+            self.flying = saved.flying;
+            tracing::debug!(uuid = %self.uuid, ?saved, "restored the player's position");
+        }
         tracing::info!(
             name = ?claims.display_name,
             uuid = %self.uuid,
@@ -611,12 +662,19 @@ impl Session {
             | ability::INVULNERABLE
             | ability::MAY_FLY
             | ability::INSTANT_BUILD;
+        // Flying is an ability value too: granting it keeps a player who
+        // left in the air flying when they return.
+        let values = if self.flying {
+            creative | ability::FLYING
+        } else {
+            creative
+        };
         UpdateAbilities(AbilityData {
             entity_unique_id: i64::try_from(self.entity_id)
                 .expect("entity IDs stay far below i64::MAX"),
             player_permissions: 1,
             command_permissions: 0,
-            layers: vec![AbilityLayer::base(creative)],
+            layers: vec![AbilityLayer::base(values)],
         })
     }
 
@@ -686,7 +744,11 @@ impl Session {
                     centre: self.view.centre().unwrap_or_else(|| self.movement.chunk()),
                     radius: self.view.radius(),
                 },
-            }],
+            }]
+            .into_iter()
+            // A returning player still flying: remembered for the next save.
+            .chain(self.flying.then_some(SessionEvent::Flying(true)))
+            .collect(),
             ..Reply::default()
         }
     }
@@ -723,7 +785,24 @@ impl Session {
             events.push(SessionEvent::Sneaking(false));
         }
 
+        // Flying: remembered for saving, and answered with the abilities that
+        // accept it, as the client expects.
+        let flying = if flags.contains(&input_flag::START_FLYING) {
+            Some(true)
+        } else if flags.contains(&input_flag::STOP_FLYING) {
+            Some(false)
+        } else {
+            None
+        };
+        let mut packets = Vec::new();
+        if let Some(flying) = flying {
+            self.flying = flying;
+            events.push(SessionEvent::Flying(flying));
+            packets.push(self.own_abilities().encode());
+        }
+
         let mut reply = self.movement_input(input);
+        reply.packets.extend(packets);
         reply.events.extend(events);
         reply
     }
@@ -1286,9 +1365,9 @@ mod tests {
         assert_eq!(
             movement.position,
             Vec3 {
-                x: 8.5,
+                x: 0.5,
                 y: -60.0 + EYE_HEIGHT,
-                z: 8.5
+                z: 0.5
             }
         );
         // Initializing again does not join twice.
@@ -1372,22 +1451,14 @@ mod tests {
     fn places_hotbar_blocks_against_the_clicked_face() {
         let mut session = in_game_session();
         // Click the top (face 1) of the grass two blocks east of the player.
-        let grass = BlockPos {
-            x: 10,
-            y: -61,
-            z: 8,
-        };
+        let grass = BlockPos { x: 2, y: -61, z: 0 };
         let reply = session.handle(&place(0, grass, 1)).unwrap();
         let stone = inventory::hotbar_block(0).unwrap();
         assert_eq!(
             reply.events,
             [
                 SessionEvent::PlacedBlock {
-                    pos: BlockPos {
-                        x: 10,
-                        y: -60,
-                        z: 8
-                    },
+                    pos: BlockPos { x: 2, y: -60, z: 0 },
                     block: stone
                 },
                 SessionEvent::Swing
@@ -1399,56 +1470,106 @@ mod tests {
     #[test]
     fn refused_placements_are_undone_on_the_client() {
         let mut session = in_game_session();
-        // The player stands on (8, -61, 8): placing on top of it would be
+        // The player stands on (0, -61, 0): placing on top of it would be
         // inside them. The client already shows the block, so it gets air back.
         for refused in [
-            place(0, BlockPos { x: 8, y: -61, z: 8 }, 1),
+            place(0, BlockPos { x: 0, y: -61, z: 0 }, 1),
             // Clicking the side of grass targets grass: not air.
-            place(
-                0,
-                BlockPos {
-                    x: 10,
-                    y: -61,
-                    z: 8,
-                },
-                5,
-            ),
+            place(0, BlockPos { x: 2, y: -61, z: 0 }, 5),
             // Out of reach, and an empty slot.
             place(
                 0,
                 BlockPos {
-                    x: 40,
+                    x: 32,
                     y: -61,
-                    z: 8,
+                    z: 0,
                 },
                 1,
             ),
-            place(
-                20,
-                BlockPos {
-                    x: 10,
-                    y: -61,
-                    z: 8,
-                },
-                1,
-            ),
+            place(20, BlockPos { x: 2, y: -61, z: 0 }, 1),
         ] {
             let reply = session.handle(&refused).unwrap();
             assert!(reply.events.is_empty(), "{:?}", reply.events);
         }
         let reply = session
-            .handle(&place(0, BlockPos { x: 8, y: -61, z: 8 }, 1))
+            .handle(&place(0, BlockPos { x: 0, y: -61, z: 0 }, 1))
             .unwrap();
         assert_eq!(ids(&reply), [id::UPDATE_BLOCK]);
+    }
+
+    #[test]
+    fn new_players_start_centred_on_the_spawn_block() {
+        let mut session = session(None);
+        session
+            .handle(
+                &RequestNetworkSettings {
+                    client_protocol: PROTOCOL_VERSION,
+                }
+                .encode(),
+            )
+            .unwrap();
+        let (_, token) = client();
+        session.handle(&login_packet(token)).unwrap();
+        session
+            .handle(&pack_response(PackResponse::DownloadingFinished))
+            .unwrap();
+        let reply = session
+            .handle(&pack_response(PackResponse::StackFinished))
+            .unwrap();
+        // StartGame's player position: eyes above the middle of block (0, -60, 0).
+        let start_game = &reply.packets[2];
+        let mut position = Vec::new();
+        for value in [0.5f32, -60.0 + EYE_HEIGHT, 0.5] {
+            position.extend(value.to_le_bytes());
+        }
+        assert!(
+            start_game
+                .windows(position.len())
+                .any(|window| window == position),
+            "StartGame places the player at (0.5, {}, 0.5)",
+            -60.0 + EYE_HEIGHT
+        );
+    }
+
+    #[test]
+    fn flying_is_acknowledged_and_remembered() {
+        let mut session = in_game_session();
+        let here = Vec3 {
+            x: 0.5,
+            y: -58.0 + EYE_HEIGHT,
+            z: 0.5,
+        };
+        let with_flags = |flags: Vec<i32>| {
+            let mut input =
+                PlayerAuthInput::decode_payload(&mut mistvale_protocol::io::Reader::new(
+                    &breaking_input(here, 0.0, Vec::new())[2..],
+                ))
+                .unwrap();
+            input.input_flags = flags;
+            input.encode()
+        };
+        let reply = session
+            .handle(&with_flags(vec![input_flag::START_FLYING]))
+            .unwrap();
+        assert!(reply.events.contains(&SessionEvent::Flying(true)));
+        // The client is answered with abilities that include flying.
+        assert_eq!(ids(&reply), [id::UPDATE_ABILITIES]);
+        assert!(session.saved_player().unwrap().1.flying);
+
+        let reply = session
+            .handle(&with_flags(vec![input_flag::STOP_FLYING]))
+            .unwrap();
+        assert!(reply.events.contains(&SessionEvent::Flying(false)));
+        assert!(!session.saved_player().unwrap().1.flying);
     }
 
     #[test]
     fn swings_and_sneaking_come_from_input_flags() {
         let mut session = in_game_session();
         let here = Vec3 {
-            x: 8.5,
+            x: 0.5,
             y: -60.0 + EYE_HEIGHT,
-            z: 8.5,
+            z: 0.5,
         };
         let with_flags = |flags: Vec<i32>| {
             let mut input =
@@ -1477,11 +1598,11 @@ mod tests {
     fn breaks_blocks_in_reach_from_either_packet() {
         let mut session = in_game_session();
         let spawn_eyes = Vec3 {
-            x: 8.5,
+            x: 0.5,
             y: -60.0 + EYE_HEIGHT,
-            z: 8.5,
+            z: 0.5,
         };
-        let grass = BlockPos { x: 9, y: -61, z: 8 };
+        let grass = BlockPos { x: 1, y: -61, z: 0 };
 
         // Creative clients start breaking in PlayerAuthInput, while standing still.
         let start = BlockAction {
@@ -1517,13 +1638,13 @@ mod tests {
         // Out of reach, below the world or in an unloaded chunk: refused.
         for pos in [
             BlockPos {
-                x: 30,
+                x: 22,
                 y: -61,
-                z: 8,
+                z: 0,
             },
-            BlockPos { x: 8, y: -65, z: 8 },
+            BlockPos { x: 0, y: -65, z: 0 },
             BlockPos {
-                x: 8,
+                x: 0,
                 y: -61,
                 z: 900,
             },

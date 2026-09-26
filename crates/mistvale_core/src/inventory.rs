@@ -97,6 +97,11 @@ pub fn starting_inventory() -> InventoryContent {
     }
 }
 
+/// The block states players can place.
+pub fn block_states() -> impl Iterator<Item = BlockState> {
+    HOTBAR.iter().map(|block| BlockState::new(block.name))
+}
+
 /// The block the hotbar slot places, as a network ID. The inventory is fixed
 /// and creative, so stacks never run out.
 pub fn hotbar_block(slot: i32) -> Option<u32> {

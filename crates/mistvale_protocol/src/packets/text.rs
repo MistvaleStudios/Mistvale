@@ -91,6 +91,14 @@ impl Text {
     /// Longest message clients accept, in bytes.
     pub const MAX_MESSAGE_LEN: usize = 65_536;
 
+    /// A message from the server itself, such as a plugin announcement.
+    pub fn system(message: impl Into<String>) -> Self {
+        Self {
+            text_type: TextType::System,
+            ..Self::raw(message)
+        }
+    }
+
     /// Plain text in the chat, from no one in particular.
     pub fn raw(message: impl Into<String>) -> Self {
         Self {

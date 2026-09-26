@@ -4,8 +4,5 @@
 /keys/
 *.pem
 
-# Personal notes, not part of the project.
-/roadmap.txt
-
 # World data saved by the server.
 /world/

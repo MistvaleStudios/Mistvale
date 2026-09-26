@@ -9,8 +9,10 @@ use mistvale_protocol::packet::Encode as _;
 use mistvale_protocol::packets::{LevelEvent, LevelSoundEvent, UpdateBlock};
 use mistvale_protocol::types::{BlockPos, ChunkPos, Vec3};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use crate::players::Players;
+use crate::storage::SavedPlayer;
 use crate::world::World;
 
 /// Ticks between saves of changed chunks: every 5 seconds.
@@ -59,6 +61,17 @@ impl Server {
             Ok(saved) => tracing::debug!(saved, "saved changed chunks"),
             Err(err) => tracing::error!(%err, "failed to save the world"),
         }
+        // Where everyone online is, in case the server stops without them leaving.
+        for (uuid, player) in self.players.saved() {
+            self.save_player(uuid, &player);
+        }
+    }
+
+    /// Saves where a player is, logging a failure.
+    pub fn save_player(&self, uuid: Uuid, player: &SavedPlayer) {
+        if let Err(err) = self.world.save_player(uuid, player) {
+            tracing::error!(%uuid, %err, "failed to save a player");
+        }
     }
 
     /// Replaces the block at `pos` with air. Every player whose client has
@@ -105,7 +118,11 @@ impl Server {
     /// Carries out one plugin action.
     pub fn apply(&self, action: Action) {
         match action {
-            Action::Broadcast(message) => self.players.broadcast_message(&message),
+            Action::Broadcast(message) => {
+                // Logged so the server log shows each chat line exactly as sent.
+                tracing::info!(target: "chat", recipients = self.players.count(), "[broadcast] {message}");
+                self.players.broadcast_message(&message);
+            }
         }
     }
 }
