@@ -29,12 +29,13 @@ use mistvale_protocol::login::{ConnectionRequest, LoginError};
 use mistvale_protocol::nbt::Compound;
 use mistvale_protocol::packet::{self, Encode as _, id};
 use mistvale_protocol::packets::{
-    ChunkRadiusUpdated, CreativeContent, Disconnect, DisconnectMessage, DisconnectReason,
-    EXEMPTED_PACKS, GameRule, GameRuleValue, ItemRegistry, JigsawStructureData, Login,
-    NetworkChunkPublisherUpdate, NetworkSettings, PackResponse, PlayStatus, PlayStatusCode,
-    PlayerAuthInput, PlayerMovementSettings, RequestChunkRadius, RequestNetworkSettings,
-    ResourcePackClientResponse, ResourcePackStack, ResourcePacksInfo, SetActorData,
-    SetLocalPlayerAsInitialized, StackPack, StartGame, Text, TextType, VoxelShapes,
+    AbilityData, AbilityLayer, Attribute, ChunkRadiusUpdated, CreativeContent, Disconnect,
+    DisconnectMessage, DisconnectReason, EXEMPTED_PACKS, GameRule, GameRuleValue, ItemRegistry,
+    JigsawStructureData, Login, NetworkChunkPublisherUpdate, NetworkSettings, PackResponse,
+    PlayStatus, PlayStatusCode, PlayerAuthInput, PlayerMovementSettings, RequestChunkRadius,
+    RequestNetworkSettings, ResourcePackClientResponse, ResourcePackStack, ResourcePacksInfo,
+    SetActorData, SetLocalPlayerAsInitialized, StackPack, StartGame, Text, TextType,
+    UpdateAbilities, UpdateAttributes, VoxelShapes, ability,
 };
 use mistvale_protocol::types::{BlockPos, ChunkPos, Vec3};
 use mistvale_protocol::{GAME_VERSION, PROTOCOL_VERSION};
@@ -517,6 +518,10 @@ impl Session {
                 }
                 .encode(),
             );
+            // Speeds: the client moves its own player, using the movement
+            // attribute and the walk and fly speeds of its ability layer.
+            packets.push(self.own_attributes().encode());
+            packets.push(self.own_abilities().encode());
             packets.push(
                 PlayStatus {
                     status: PlayStatusCode::PlayerSpawn,
@@ -531,6 +536,41 @@ impl Session {
             events: self.view_event(),
             ..Reply::default()
         }
+    }
+
+    /// Vanilla defaults for the attributes that govern how the client moves
+    /// its player, plus health.
+    fn own_attributes(&self) -> UpdateAttributes {
+        UpdateAttributes {
+            entity_runtime_id: self.entity_id,
+            attributes: vec![
+                Attribute::at_default("minecraft:movement", 0.0, f32::MAX, ability::WALK_SPEED),
+                Attribute::at_default("minecraft:underwater_movement", 0.0, f32::MAX, 0.02),
+                Attribute::at_default("minecraft:lava_movement", 0.0, f32::MAX, 0.02),
+                Attribute::at_default("minecraft:health", 0.0, 20.0, 20.0),
+            ],
+            tick: 0,
+        }
+    }
+
+    /// A creative player's abilities at vanilla walk and fly speeds.
+    fn own_abilities(&self) -> UpdateAbilities {
+        let creative = ability::BUILD
+            | ability::MINE
+            | ability::DOORS_AND_SWITCHES
+            | ability::OPEN_CONTAINERS
+            | ability::ATTACK_PLAYERS
+            | ability::ATTACK_MOBS
+            | ability::INVULNERABLE
+            | ability::MAY_FLY
+            | ability::INSTANT_BUILD;
+        UpdateAbilities(AbilityData {
+            entity_unique_id: i64::try_from(self.entity_id)
+                .expect("entity IDs stay far below i64::MAX"),
+            player_permissions: 1,
+            command_permissions: 0,
+            layers: vec![AbilityLayer::base(creative)],
+        })
     }
 
     /// The chunks the client shows now, for the rest of the server once the
@@ -919,11 +959,26 @@ mod tests {
         // The chunks within a circle of radius 4: 49 of them.
         let chunks = sent.iter().filter(|id| **id == id::LEVEL_CHUNK).count();
         assert_eq!(chunks, 49);
-        // The player's own entity data (gravity!) comes just before PlayerSpawn.
+        // The player's own entity data (gravity), attributes and abilities
+        // (speeds) come just before PlayerSpawn.
         assert_eq!(
-            sent[sent.len() - 3..],
-            [id::SET_ACTOR_DATA, id::PLAY_STATUS, id::CREATIVE_CONTENT]
+            sent[sent.len() - 5..],
+            [
+                id::SET_ACTOR_DATA,
+                id::UPDATE_ATTRIBUTES,
+                id::UPDATE_ABILITIES,
+                id::PLAY_STATUS,
+                id::CREATIVE_CONTENT
+            ]
         );
+        let attributes = &reply.packets[sent.len() - 4];
+        let movement = b"minecraft:movement";
+        let at = attributes
+            .windows(movement.len())
+            .position(|window| window == movement)
+            .expect("the movement attribute is sent");
+        // The six floats before the name end with the default: vanilla's 0.1.
+        assert_eq!(attributes[at - 5..at - 1], 0.1f32.to_le_bytes());
         let spawn: PlayStatus = decode_only(&reply.packets[sent.len() - 2]);
         assert_eq!(spawn.status, PlayStatusCode::PlayerSpawn);
         assert_eq!(session.stage(), Stage::Initializing);

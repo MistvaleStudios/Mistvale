@@ -15,6 +15,7 @@ pub mod id {
     pub const ADD_PLAYER: u32 = 12;
     pub const REMOVE_ACTOR: u32 = 14;
     pub const MOVE_PLAYER: u32 = 19;
+    pub const UPDATE_ATTRIBUTES: u32 = 29;
     pub const SET_ACTOR_DATA: u32 = 39;
     pub const LEVEL_CHUNK: u32 = 58;
     pub const PLAYER_LIST: u32 = 63;
@@ -27,6 +28,7 @@ pub mod id {
     pub const PLAYER_AUTH_INPUT: u32 = 144;
     pub const CREATIVE_CONTENT: u32 = 145;
     pub const ITEM_REGISTRY: u32 = 162;
+    pub const UPDATE_ABILITIES: u32 = 187;
     pub const REQUEST_NETWORK_SETTINGS: u32 = 193;
     pub const JIGSAW_STRUCTURE_DATA: u32 = 313;
     pub const VOXEL_SHAPES: u32 = 337;

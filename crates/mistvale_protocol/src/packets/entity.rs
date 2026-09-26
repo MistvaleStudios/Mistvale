@@ -36,6 +36,154 @@ pub mod entity_flag {
     }
 }
 
+/// Ability bits of an [`AbilityLayer`], as gophertunnel and PocketMine number them.
+pub mod ability {
+    pub const BUILD: u32 = 1 << 0;
+    pub const MINE: u32 = 1 << 1;
+    pub const DOORS_AND_SWITCHES: u32 = 1 << 2;
+    pub const OPEN_CONTAINERS: u32 = 1 << 3;
+    pub const ATTACK_PLAYERS: u32 = 1 << 4;
+    pub const ATTACK_MOBS: u32 = 1 << 5;
+    pub const INVULNERABLE: u32 = 1 << 8;
+    pub const FLYING: u32 = 1 << 9;
+    pub const MAY_FLY: u32 = 1 << 10;
+    pub const INSTANT_BUILD: u32 = 1 << 11;
+    /// Every one of the 20 abilities.
+    pub const ALL: u32 = (1 << 20) - 1;
+
+    /// Vanilla speeds, in blocks per tick.
+    pub const WALK_SPEED: f32 = 0.1;
+    pub const FLY_SPEED: f32 = 0.05;
+    pub const VERTICAL_FLY_SPEED: f32 = 1.0;
+}
+
+/// One layer of a player's abilities. `abilities` says which abilities the
+/// layer defines, `values` which of those are granted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AbilityLayer {
+    /// 1 is the base layer.
+    pub layer: u16,
+    pub abilities: u32,
+    pub values: u32,
+    pub fly_speed: f32,
+    pub vertical_fly_speed: f32,
+    pub walk_speed: f32,
+}
+
+impl AbilityLayer {
+    /// A base layer defining every ability, granting `values`, at vanilla speeds.
+    pub fn base(values: u32) -> Self {
+        Self {
+            layer: 1,
+            abilities: ability::ALL,
+            values,
+            fly_speed: ability::FLY_SPEED,
+            vertical_fly_speed: ability::VERTICAL_FLY_SPEED,
+            walk_speed: ability::WALK_SPEED,
+        }
+    }
+}
+
+/// A player's permissions and ability layers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AbilityData {
+    pub entity_unique_id: i64,
+    /// 0 visitor, 1 member, 2 operator.
+    pub player_permissions: u8,
+    pub command_permissions: u8,
+    pub layers: Vec<AbilityLayer>,
+}
+
+impl AbilityData {
+    fn write(&self, writer: &mut Writer) {
+        writer.i64_le(self.entity_unique_id);
+        writer.u8(self.player_permissions);
+        writer.u8(self.command_permissions);
+        writer.var_u32(len_u32(self.layers.len()));
+        for layer in &self.layers {
+            writer.u16_le(layer.layer);
+            writer.u32_le(layer.abilities);
+            writer.u32_le(layer.values);
+            writer.f32_le(layer.fly_speed);
+            writer.f32_le(layer.vertical_fly_speed);
+            writer.f32_le(layer.walk_speed);
+        }
+    }
+}
+
+/// Tells the client what its own player may do and how fast it walks and flies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateAbilities(pub AbilityData);
+
+impl Packet for UpdateAbilities {
+    const ID: u32 = id::UPDATE_ABILITIES;
+}
+
+impl Encode for UpdateAbilities {
+    fn encode_payload(&self, writer: &mut Writer) {
+        self.0.write(writer);
+    }
+}
+
+/// An entity attribute such as `minecraft:movement`, with its range and default.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attribute {
+    pub name: String,
+    pub min: f32,
+    pub max: f32,
+    pub value: f32,
+    pub default_min: f32,
+    pub default_max: f32,
+    pub default: f32,
+}
+
+impl Attribute {
+    /// An attribute from `min` to `max` currently at its default `value`.
+    pub fn at_default(name: impl Into<String>, min: f32, max: f32, value: f32) -> Self {
+        Self {
+            name: name.into(),
+            min,
+            max,
+            value,
+            default_min: min,
+            default_max: max,
+            default: value,
+        }
+    }
+}
+
+/// Sets attributes of an entity; for the player's own entity, `minecraft:movement`
+/// is the speed its client walks at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateAttributes {
+    pub entity_runtime_id: u64,
+    pub attributes: Vec<Attribute>,
+    pub tick: u64,
+}
+
+impl Packet for UpdateAttributes {
+    const ID: u32 = id::UPDATE_ATTRIBUTES;
+}
+
+impl Encode for UpdateAttributes {
+    fn encode_payload(&self, writer: &mut Writer) {
+        writer.var_u64(self.entity_runtime_id);
+        writer.var_u32(len_u32(self.attributes.len()));
+        for attribute in &self.attributes {
+            writer.f32_le(attribute.min);
+            writer.f32_le(attribute.max);
+            writer.f32_le(attribute.value);
+            writer.f32_le(attribute.default_min);
+            writer.f32_le(attribute.default_max);
+            writer.f32_le(attribute.default);
+            writer.string(&attribute.name);
+            // No modifiers.
+            writer.var_u32(0);
+        }
+        writer.var_u64(self.tick);
+    }
+}
+
 /// Updates an entity's metadata, including the player's own entity.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetActorData {
@@ -146,17 +294,14 @@ impl Encode for AddPlayer {
         // No integer or float entity properties.
         writer.var_u32(0);
         writer.var_u32(0);
-        // Ability data: every ability in the base layer, as Dragonfly sends.
-        writer.i64_le(self.entity_unique_id);
-        writer.u8(1); // player permissions: member
-        writer.u8(0); // command permissions: normal
-        writer.var_u32(1);
-        writer.u16_le(1); // base layer
-        writer.u32_le((1 << 19) - 1);
-        writer.u32_le(0);
-        writer.f32_le(0.0);
-        writer.f32_le(0.0);
-        writer.f32_le(0.0);
+        // Ability data: a base layer defining every ability, as Dragonfly sends.
+        AbilityData {
+            entity_unique_id: self.entity_unique_id,
+            player_permissions: 1,
+            command_permissions: 0,
+            layers: vec![AbilityLayer::base(0)],
+        }
+        .write(writer);
         // No entity links, no device ID, unknown build platform.
         writer.var_u32(0);
         writer.string("");
@@ -413,6 +558,49 @@ mod tests {
         let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
         assert!(contains(HUMANOID_GEOMETRY.as_bytes()));
         assert!(contains(b"\x050.0.0"));
+    }
+
+    #[test]
+    fn update_attributes_layout() {
+        let packet = UpdateAttributes {
+            entity_runtime_id: 1,
+            attributes: vec![Attribute::at_default(
+                "minecraft:movement",
+                0.0,
+                f32::MAX,
+                0.1,
+            )],
+            tick: 0,
+        };
+        let mut expected = vec![0x1D, 0x01, 0x01];
+        for value in [0.0f32, f32::MAX, 0.1, 0.0, f32::MAX, 0.1] {
+            expected.extend(value.to_le_bytes());
+        }
+        expected.push(18);
+        expected.extend(b"minecraft:movement");
+        expected.extend([0x00, 0x00]);
+        assert_eq!(packet.encode(), expected);
+    }
+
+    #[test]
+    fn update_abilities_layout() {
+        let packet = UpdateAbilities(AbilityData {
+            entity_unique_id: 2,
+            player_permissions: 1,
+            command_permissions: 0,
+            layers: vec![AbilityLayer::base(ability::MAY_FLY)],
+        });
+        let bytes = packet.encode();
+        assert_eq!(bytes[..2], [0xBB, 0x01]);
+        assert_eq!(bytes[2..10], 2i64.to_le_bytes());
+        assert_eq!(bytes[10..13], [0x01, 0x00, 0x01]);
+        assert_eq!(bytes[13..15], 1u16.to_le_bytes());
+        assert_eq!(bytes[15..19], 0x000F_FFFFu32.to_le_bytes());
+        assert_eq!(bytes[19..23], (1u32 << 10).to_le_bytes());
+        // Fly, vertical fly and walk speeds.
+        assert_eq!(bytes[23..27], 0.05f32.to_le_bytes());
+        assert_eq!(bytes[27..31], 1.0f32.to_le_bytes());
+        assert_eq!(bytes[31..], 0.1f32.to_le_bytes());
     }
 
     #[test]

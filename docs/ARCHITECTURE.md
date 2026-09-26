@@ -603,6 +603,13 @@ DTLS, SCTP, and multi-segment messages both ways.
   - The same metadata goes to each player about **their own** entity, as a SetActorData
     just before PlayerSpawn. Without HasGravity the client does not pull its own player
     down: the first live test showed players drifting upward after they stopped flying.
+  - Also during spawn, each player gets their own **UpdateAttributes** (`minecraft:movement`
+    0.1, underwater and lava movement 0.02, health 20) and **UpdateAbilities** (a base
+    layer defining all 20 abilities, granting the creative ones, at walk 0.1, fly 0.05 and
+    vertical fly 1.0). The client moves its own player with these; without them walking
+    was far faster than vanilla. Other players' AddPlayer carries the same base layer
+    without granted abilities; its all-abilities mask used to miss bit 19 (vertical fly
+    speed).
   - Skins are not forwarded yet: each player appears with a plain 64×64 classic skin,
     coloured from their UUID, on a humanoid geometry the skin defines itself.
 - **Chunk streaming (implemented):** each session keeps a `view::ChunkView`: the chunk
@@ -714,7 +721,8 @@ Each step starts only after explicit confirmation.
 | 6 | Plugins meet the world: `player_join` event, Text packet and chat relay, Luau `server.on` / `server.broadcast`, welcome message in `hello.luau` | A live client sees the welcome message, and chat is echoed | ✅ done 2026-09-25; the yellow welcome appeared for a vanilla 1.26.51 client (commit `59e8247`) |
 | 7 | Tick loop and visibility: 20 TPS game loop, PlayerAuthInput decoding, per-player position, rotation and head yaw, PlayerList / AddPlayer / MovePlayer / RemoveActor between players | Two live clients see each other move | ✅ done 2026-09-26; two clients (PC and Android) saw each other move after the skin geometry fix |
 | 8 | Chunk streaming: track each player's chunk, recentre on crossing a boundary, send the chunks newly in range (radius ≤ 8) with a NetworkChunkPublisherUpdate; always-visible name tags | Walking or flying far keeps loading terrain | ✅ done 2026-09-26; streaming worked live (commit `5064e11`) |
-| 9 | Entity tracker (AddPlayer and RemoveActor as players enter and leave each other's view), and own-entity metadata with HasGravity so players stop floating | A player returning to a stationary one reappears; players fall after flying | 🧪 ready for a live test (2026-09-26) |
+| 9 | Entity tracker (AddPlayer and RemoveActor as players enter and leave each other's view), and own-entity metadata with HasGravity so players stop floating | A player returning to a stationary one reappears; players fall after flying | ✅ done 2026-09-26; returning players reappear and players fall after flying (commit `25e21c9`) |
+| 10 | Vanilla movement speed: the player's own UpdateAttributes (`minecraft:movement` 0.1, underwater and lava 0.02, health 20) and UpdateAbilities (creative abilities; walk 0.1, fly 0.05, vertical fly 1.0) during spawn | Walking feels like vanilla | 🧪 ready for a live test (2026-09-26) |
 
 Later steps are proposed but not yet scheduled:
 - player auth (JWKS verification of the multiplayer token)
