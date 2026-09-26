@@ -14,7 +14,8 @@ use crate::server::Server;
 /// skips the missed ticks instead.
 const MAX_LAG: Duration = Duration::from_secs(1);
 
-/// The running game loop. Dropping it stops the loop after the current tick.
+/// The running game loop. Dropping it stops the loop after the current tick
+/// and saves the world.
 pub struct TickLoop {
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
@@ -73,6 +74,8 @@ fn run(server: &Server, stop: &AtomicBool) {
             next = now;
         }
     }
+    // Keep the changes since the last periodic save.
+    server.save();
 }
 
 #[cfg(test)]

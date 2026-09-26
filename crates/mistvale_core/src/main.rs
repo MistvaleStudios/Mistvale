@@ -7,8 +7,11 @@
 //!   (default: every IPv4 interface that is up)
 //! - `MISTVALE_ADVERTISE_IPS`: comma-separated public addresses to offer clients
 //! - `MISTVALE_ICE_LITE`: `false` switches from ICE-lite to full ICE (default `true`)
+//!
+//! `MISTVALE_WORLD_DIR` sets where the world is saved (default `world`).
 
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -42,7 +45,16 @@ async fn main() -> anyhow::Result<()> {
     let plugins = PluginHost::start(PluginConfig::default(), actions)
         .context("failed to start the plugin host")?;
     tracing::info!(loaded = ?plugins.loaded(), "plugins ready");
-    let server = Arc::new(Server::new(World::new(), plugins.dispatcher()));
+    let world_directory =
+        env_value::<PathBuf>("MISTVALE_WORLD_DIR")?.unwrap_or_else(|| PathBuf::from("world"));
+    let world = World::open(&world_directory)
+        .with_context(|| format!("failed to open the world in {}", world_directory.display()))?;
+    tracing::info!(
+        directory = %world_directory.display(),
+        saved_chunks = world.saved_chunks(),
+        "world loaded"
+    );
+    let server = Arc::new(Server::new(world, plugins.dispatcher()));
     tokio::spawn(server::apply_plugin_actions(
         Arc::clone(&server),
         plugin_actions,

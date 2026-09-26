@@ -13,6 +13,9 @@ use tokio::sync::mpsc;
 use crate::players::Players;
 use crate::world::World;
 
+/// Ticks between saves of changed chunks: every 5 seconds.
+const SAVE_INTERVAL: u64 = 100;
+
 /// Plugin actions that may wait before plugins are told the server is busy.
 pub const PLUGIN_ACTION_QUEUE: usize = 1024;
 
@@ -43,6 +46,19 @@ impl Server {
     pub fn tick(&self, tick: u64) {
         self.tick.store(tick, Ordering::Relaxed);
         self.players.tick(tick);
+        if tick.is_multiple_of(SAVE_INTERVAL) {
+            self.save();
+        }
+    }
+
+    /// Writes the chunks changed since the last save to disk, logging how it
+    /// went. Chunks that fail to save are tried again next time.
+    pub fn save(&self) {
+        match self.world.save() {
+            Ok(0) => {}
+            Ok(saved) => tracing::debug!(saved, "saved changed chunks"),
+            Err(err) => tracing::error!(%err, "failed to save the world"),
+        }
     }
 
     /// Replaces the block at `pos` with air. Every player whose client has

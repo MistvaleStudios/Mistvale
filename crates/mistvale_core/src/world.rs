@@ -2,15 +2,22 @@
 //!
 //! Every column starts as the same generated superflat column, shared as one
 //! encoded payload. Changing a block gives that column its own storage, which
-//! is kept, and re-encoded whenever it is sent after another change.
+//! is kept, re-encoded whenever it is sent after another change, and marked
+//! for saving. A world opened on a directory loads saved columns the first
+//! time they are needed and saves changed ones with [`World::save`]; a world
+//! from [`World::new`] lives only in memory.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io;
+use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use mistvale_protocol::block::{BlockState, StateValue};
 use mistvale_protocol::chunk::{self, PalettedStorage, SubChunk};
 use mistvale_protocol::packets::LevelChunk;
 use mistvale_protocol::types::{BlockPos, ChunkPos};
+
+use crate::storage::{BLOCKS, ChunkStore, SubChunkBlocks};
 
 /// Overworld dimension ID.
 pub const OVERWORLD: i32 = 0;
@@ -32,6 +39,15 @@ struct Column {
     sub_chunks: Vec<Option<PalettedStorage>>,
     /// The encoded LevelChunk payload, until the next change.
     payload: Option<Vec<u8>>,
+    /// Changed since it was last saved.
+    dirty: bool,
+}
+
+/// Columns held in memory, and the saved ones not loaded yet.
+#[derive(Debug, Default)]
+struct State {
+    columns: HashMap<ChunkPos, Column>,
+    on_disk: HashSet<ChunkPos>,
 }
 
 /// An endless superflat overworld with vanilla's default layers (bedrock, two
@@ -42,13 +58,15 @@ pub struct World {
     /// The generated column, which every unchanged chunk shares.
     generated: Column,
     generated_payload: Vec<u8>,
-    /// Columns with changes, by chunk position.
-    changed: Mutex<HashMap<ChunkPos, Column>>,
+    state: Mutex<State>,
+    /// Where changed columns are saved, if anywhere.
+    store: Option<ChunkStore>,
     /// Height of the top (grass) layer.
     surface_y: i32,
 }
 
 impl World {
+    /// A world that lives only in memory.
     pub fn new() -> Self {
         let air = BlockState::new("minecraft:air").network_id();
         let dirt = BlockState::new("minecraft:dirt");
@@ -71,6 +89,7 @@ impl World {
         let mut generated = Column {
             sub_chunks: vec![None; SUB_CHUNKS],
             payload: None,
+            dirty: false,
         };
         generated.sub_chunks[0] = Some(blocks);
         let generated_payload = generated.encode(air);
@@ -79,9 +98,34 @@ impl World {
             air,
             generated,
             generated_payload,
-            changed: Mutex::new(HashMap::new()),
+            state: Mutex::new(State::default()),
+            store: None,
             surface_y: MIN_Y + layers.len() as i32 - 1,
         }
+    }
+
+    /// The world saved in `directory`, created if it does not exist yet.
+    pub fn open(directory: &Path) -> io::Result<Self> {
+        let (store, saved) = ChunkStore::open(directory)?;
+        let mut world = Self::new();
+        world.store = Some(store);
+        world
+            .state
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .on_disk = saved;
+        Ok(world)
+    }
+
+    /// How many chunks have saved changes on disk, loaded or not.
+    pub fn saved_chunks(&self) -> usize {
+        let state = self.state();
+        state.on_disk.len()
+            + state
+                .columns
+                .values()
+                .filter(|column| !column.dirty)
+                .count()
     }
 
     /// Where players spawn: standing on the grass in the middle of chunk (0, 0).
@@ -103,10 +147,10 @@ impl World {
         let Some((sub_chunk, x, y, z)) = locate(pos) else {
             return self.air;
         };
-        let changed = self.changed();
-        let column = changed
-            .get(&ChunkPos::of_block(pos))
-            .unwrap_or(&self.generated);
+        let chunk = ChunkPos::of_block(pos);
+        let mut state = self.state();
+        self.load(&mut state, chunk);
+        let column = state.columns.get(&chunk).unwrap_or(&self.generated);
         column.sub_chunks[sub_chunk]
             .as_ref()
             .map_or(self.air, |storage| storage.get(x, y, z))
@@ -135,27 +179,36 @@ impl World {
     /// under one lock. Returns the previous block if anything changed.
     fn update_block(&self, pos: BlockPos, change: impl FnOnce(u32) -> Option<u32>) -> Option<u32> {
         let (sub_chunk, x, y, z) = locate(pos)?;
-        let mut changed = self.changed();
         let chunk = ChunkPos::of_block(pos);
-        let current = changed.get(&chunk).unwrap_or(&self.generated).sub_chunks[sub_chunk]
+        let mut state = self.state();
+        self.load(&mut state, chunk);
+        let current = state
+            .columns
+            .get(&chunk)
+            .unwrap_or(&self.generated)
+            .sub_chunks[sub_chunk]
             .as_ref()
             .map_or(self.air, |storage| storage.get(x, y, z));
         let block = change(current).filter(|block| *block != current)?;
 
-        let column = changed
+        let column = state
+            .columns
             .entry(chunk)
             .or_insert_with(|| self.generated.clone());
         column.sub_chunks[sub_chunk]
             .get_or_insert_with(|| PalettedStorage::filled(self.air))
             .set(x, y, z, block);
         column.payload = None;
+        column.dirty = true;
         Some(current)
     }
 
     /// The chunk column at chunk coordinates (`x`, `z`), with any changes.
     pub fn chunk(&self, x: i32, z: i32) -> LevelChunk {
-        let mut changed = self.changed();
-        let (sub_chunk_count, payload) = match changed.get_mut(&ChunkPos::new(x, z)) {
+        let chunk = ChunkPos::new(x, z);
+        let mut state = self.state();
+        self.load(&mut state, chunk);
+        let (sub_chunk_count, payload) = match state.columns.get_mut(&chunk) {
             Some(column) => {
                 if column.payload.is_none() {
                     column.payload = Some(column.encode(self.air));
@@ -177,9 +230,98 @@ impl World {
         }
     }
 
-    fn changed(&self) -> MutexGuard<'_, HashMap<ChunkPos, Column>> {
+    /// Writes every column changed since the last save. Returns how many were
+    /// saved; a column that fails to save stays marked and is tried next time.
+    pub fn save(&self) -> io::Result<usize> {
+        let Some(store) = &self.store else {
+            return Ok(0);
+        };
+        // Copy the changed columns out, so players are not kept waiting on disk.
+        let changed: Vec<(ChunkPos, Vec<SubChunkBlocks>)> = self
+            .state()
+            .columns
+            .iter_mut()
+            .filter(|(_, column)| column.dirty)
+            .map(|(chunk, column)| {
+                column.dirty = false;
+                (*chunk, column.blocks())
+            })
+            .collect();
+
+        let mut saved = 0;
+        let mut first_error = None;
+        for (chunk, blocks) in changed {
+            match store.save(chunk, &blocks) {
+                Ok(()) => saved += 1,
+                Err(err) => {
+                    if let Some(column) = self.state().columns.get_mut(&chunk) {
+                        column.dirty = true;
+                    }
+                    first_error.get_or_insert(err);
+                }
+            }
+        }
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(saved),
+        }
+    }
+
+    /// Brings a saved column into memory the first time its chunk is used. A
+    /// file that cannot be read is logged, and the chunk is generated instead.
+    fn load(&self, state: &mut State, chunk: ChunkPos) {
+        if !state.on_disk.remove(&chunk) {
+            return;
+        }
+        let Some(store) = &self.store else {
+            return;
+        };
+        let loaded = store
+            .load(chunk)
+            .map_err(|err| err.to_string())
+            .and_then(|blocks| self.column_from(blocks));
+        match loaded {
+            Ok(column) => {
+                state.columns.insert(chunk, column);
+            }
+            Err(err) => {
+                tracing::warn!(chunk = ?(chunk.x, chunk.z), %err, "ignoring a saved chunk that cannot be read");
+            }
+        }
+    }
+
+    fn column_from(&self, blocks: Vec<SubChunkBlocks>) -> Result<Column, String> {
+        if blocks.len() != SUB_CHUNKS {
+            return Err(format!(
+                "{} sub-chunks, expected {SUB_CHUNKS}",
+                blocks.len()
+            ));
+        }
+        let sub_chunks = blocks
+            .into_iter()
+            .map(|blocks| {
+                blocks.map(|blocks| {
+                    let mut storage = PalettedStorage::filled(self.air);
+                    for (index, block) in blocks.into_iter().enumerate() {
+                        if block != self.air {
+                            let (x, y, z) = position_of(index);
+                            storage.set(x, y, z, block);
+                        }
+                    }
+                    storage
+                })
+            })
+            .collect();
+        Ok(Column {
+            sub_chunks,
+            payload: None,
+            dirty: false,
+        })
+    }
+
+    fn state(&self) -> MutexGuard<'_, State> {
         // Columns stay consistent even if a holder panicked.
-        self.changed.lock().unwrap_or_else(PoisonError::into_inner)
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -190,6 +332,23 @@ impl Default for World {
 }
 
 impl Column {
+    /// Every sub-chunk's blocks, in the storage file's order.
+    fn blocks(&self) -> Vec<SubChunkBlocks> {
+        self.sub_chunks
+            .iter()
+            .map(|storage| {
+                storage.as_ref().map(|storage| {
+                    (0..BLOCKS)
+                        .map(|index| {
+                            let (x, y, z) = position_of(index);
+                            storage.get(x, y, z)
+                        })
+                        .collect()
+                })
+            })
+            .collect()
+    }
+
     /// Sub-chunks sent: up to the highest one holding anything but air.
     fn sent_sub_chunks(&self) -> u32 {
         let highest = self
@@ -219,6 +378,16 @@ impl Column {
     }
 }
 
+/// The position within a sub-chunk of the `index`th block, in x, z, y order
+/// (the order of paletted storage and of chunk files).
+fn position_of(index: usize) -> (u8, u8, u8) {
+    (
+        ((index >> 8) & 15) as u8,
+        (index & 15) as u8,
+        ((index >> 4) & 15) as u8,
+    )
+}
+
 /// The sub-chunk index (from the bottom) and position within it of `pos`, if
 /// `pos` is within the world's height.
 fn locate(pos: BlockPos) -> Option<(usize, u8, u8, u8)> {
@@ -236,6 +405,8 @@ fn locate(pos: BlockPos) -> Option<(usize, u8, u8, u8)> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use mistvale_protocol::chunk::SUB_CHUNK_VERSION;
 
     use super::*;
@@ -313,5 +484,81 @@ mod tests {
         assert!(!world.set_block(BlockPos { x: 0, y: 320, z: 0 }, stone));
         assert!(!world.set_block(BlockPos { x: 0, y: -65, z: 0 }, stone));
         assert_eq!(world.block(BlockPos { x: 0, y: 400, z: 0 }), world.air());
+    }
+
+    fn temporary_world(name: &str) -> PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("mistvale-world-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        directory
+    }
+
+    #[test]
+    fn changes_survive_a_restart() {
+        let directory = temporary_world("restart");
+        let stone = BlockState::new("minecraft:stone").network_id();
+        let hole = BlockPos {
+            x: 3,
+            y: -61,
+            z: -5,
+        };
+        let tower = BlockPos {
+            x: 20,
+            y: 100,
+            z: 20,
+        };
+
+        let world = World::open(&directory).unwrap();
+        assert!(world.set_block(hole, world.air()));
+        assert!(world.set_block(tower, stone));
+        let before = world.chunk(1, 1).payload;
+        assert_eq!(world.save().unwrap(), 2);
+        assert_eq!(world.save().unwrap(), 0, "nothing changed since");
+        drop(world);
+
+        // A fresh server on the same directory sees the same world.
+        let world = World::open(&directory).unwrap();
+        assert_eq!(world.saved_chunks(), 2);
+        assert_eq!(world.block(hole), world.air());
+        assert_eq!(world.block(tower), stone);
+        assert_eq!(world.chunk(1, 1).payload, before);
+        // Untouched chunks are still generated, and not saved.
+        assert_eq!(
+            world.block(BlockPos {
+                x: 40,
+                y: -61,
+                z: 40
+            }),
+            BlockState::new("minecraft:grass_block").network_id()
+        );
+        assert_eq!(world.save().unwrap(), 0);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_chunk_file_falls_back_to_generation() {
+        let directory = temporary_world("damaged");
+        let world = World::open(&directory).unwrap();
+        world.set_block(BlockPos { x: 0, y: -61, z: 0 }, world.air());
+        world.save().unwrap();
+        drop(world);
+        std::fs::write(directory.join("chunks").join("c.0.0.bin"), b"garbage").unwrap();
+
+        let world = World::open(&directory).unwrap();
+        assert_eq!(
+            world.block(BlockPos { x: 0, y: -61, z: 0 }),
+            BlockState::new("minecraft:grass_block").network_id()
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn block_positions_follow_storage_order() {
+        // (x, y, z) from indices ordered x, then z, then y.
+        assert_eq!(position_of(0), (0, 0, 0));
+        assert_eq!(position_of(1), (0, 1, 0));
+        assert_eq!(position_of(16), (0, 0, 1));
+        assert_eq!(position_of(256), (1, 0, 0));
+        assert_eq!(position_of(4095), (15, 15, 15));
     }
 }

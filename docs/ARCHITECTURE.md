@@ -679,7 +679,25 @@ DTLS, SCTP, and multi-segment messages both ways.
     themselves, which Mojang's docs say the client expects.
   - AddPlayer carries the current sneaking state.
 
-  Persistence, generation beyond superflat and entities are not started yet.
+- **Persistence (implemented):** `World::open(dir)` (the binary uses `MISTVALE_WORLD_DIR`,
+  default `world`, which is git-ignored) keeps changed chunks on disk; `World::new` stays
+  in memory, for tests.
+  - `storage::ChunkStore` writes one file per changed column, `chunks/c.<x>.<z>.bin`: the
+    magic `MVCH`, a version byte, then zlib data. That data is the sub-chunk count, and
+    for each sub-chunk a presence byte plus 4096 little-endian u32 block network IDs.
+    Uniform sub-chunks compress to a few hundred bytes.
+  - Writes go to a `.tmp` file that is renamed over the old one, so a crash never leaves
+    half a chunk. There are no new dependencies: `flate2` was already in use, and SQLite
+    (C) or `sled` (pre-1.0, dormant) were not needed for per-chunk blobs.
+  - Opening lists the saved chunks without reading them. A saved chunk is loaded the
+    first time it is read, changed or sent. A file that cannot be read is logged, and the
+    chunk is generated instead.
+  - Changes mark a column dirty. The tick loop saves dirty columns every 100 ticks (5 s),
+    and once more when it stops (Ctrl+C). Columns are copied out under the lock and
+    written after it is released, and a failed write stays dirty for the next save.
+    Killing the process loses at most 5 s of changes.
+
+  Generation beyond superflat and entities are not started yet.
 
 ### 4.6 `mistvale_plugins`
 
@@ -776,7 +794,8 @@ Each step starts only after explicit confirmation.
 | 10 | Vanilla movement speed: the player's own UpdateAttributes (`minecraft:movement` 0.1, underwater and lava 0.02, health 20) and UpdateAbilities (creative abilities; walk 0.1, fly 0.05, vertical fly 1.0) during spawn | Walking feels like vanilla | ✅ done 2026-09-26; walking feels like vanilla (commit `4bce850`) |
 | 11 | Mutable world and block breaking: `World` keeps changed columns; breaks from PlayerAuthInput block actions (StartBreak, PredictDestroyBlock) and PlayerAction (CreativeDestroyBlock), checked for height, reach and loaded chunk; UpdateBlock to every player with the chunk | Broken blocks stay broken, for everyone, and after walking away and back | ✅ done 2026-09-26; breaks persist and sync across clients (commit `e9ebff0`) |
 | 12 | Block placing and feedback: a hotbar of 9 vanilla blocks (a partial ItemRegistry with vanilla item IDs, InventoryContent at spawn), ClickBlock from InventoryTransaction placed against the clicked face (reach, air, not inside the placer; refusals undone with UpdateBlock), UpdateBlock plus the `place` sound; break particles (LevelEvent 2001); arm swings (Animate); sneaking (SetActorData) | Blocks can be placed and everyone sees and hears building; swings and crouching show | ✅ done 2026-09-26; hotbar, placing, particles, sounds, swings and sneaking work (commit `c3a895b`) |
-| 13 | Placement never overlaps a player: every online player's box is checked, and refusals are rolled back | A block cannot be placed where another player stands | 🧪 ready for a live test (2026-09-26) |
+| 13 | Placement never overlaps a player: every online player's box is checked, and refusals are rolled back | A block cannot be placed where another player stands | ✅ done 2026-09-26; blocks vanish when placed inside another player (commit `8e8e1c4`) |
+| 14 | World persistence: changed chunks saved as one compressed file each under `world/chunks/`, every 5 s from the tick loop and on shutdown; loaded the first time a chunk is used, generated otherwise | Builds survive a server restart | 🧪 ready for a live test (2026-09-26) |
 
 Later steps are proposed but not yet scheduled:
 - player auth (JWKS verification of the multiplayer token)
@@ -815,6 +834,11 @@ Later steps are proposed but not yet scheduled:
   the flag numbering question is settled: the bit numbers in Mojang's PlayerActionType
   descriptions match gophertunnel's input flags (StartSneaking is bit 27, MissedSwing
   bit 39). Mojang's enum just omits some entries.
+- **Saved chunks store block state hashes.** A hash changes if Mojang renames a block or
+  changes its states, which would turn saved blocks into unknown ones after an update.
+  Storing block names and states instead is the robust format, and the version byte
+  leaves room for it. Changed columns also stay in memory until shutdown; unloading is
+  not needed at this scale yet.
 - **A partial ItemRegistry is untested with a live client.** Only nine items are
   registered, with vanilla's IDs, where vanilla sends about 1,900. An empty registry
   worked for spawning, but held items might not render or be usable. The hotbar blocks

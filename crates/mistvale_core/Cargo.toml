@@ -18,6 +18,7 @@ python = ["mistvale_plugins/python"]
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true
+flate2.workspace = true
 mistvale_net.workspace = true
 mistvale_plugins.workspace = true
 mistvale_protocol.workspace = true

@@ -11,6 +11,7 @@ pub mod inventory;
 pub mod players;
 pub mod server;
 pub mod session;
+pub mod storage;
 pub mod tick;
 pub mod view;
 pub mod world;
