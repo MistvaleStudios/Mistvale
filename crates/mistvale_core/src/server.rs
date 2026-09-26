@@ -64,10 +64,13 @@ impl Server {
             .send_to_viewers(chunk, &Bytes::from(effect.encode()));
     }
 
-    /// Puts `block` at `pos` if it is air there. Every player whose client has
-    /// that chunk sees it and hears it placed. Returns whether it was placed.
+    /// Puts `block` at `pos` if it is air there and no player's body is in
+    /// the way. Every player whose client has that chunk sees it and hears it
+    /// placed. Returns whether it was placed; the caller undoes a refused
+    /// placement the client already predicted.
     pub fn place_block(&self, pos: BlockPos, block: u32) -> bool {
-        if !self.world.place_block(pos, block) {
+        // A block inside a player traps them, and their client fights it.
+        if self.players.occupies(pos) || !self.world.place_block(pos, block) {
             return false;
         }
         let chunk = ChunkPos::of_block(pos);
@@ -196,6 +199,29 @@ mod tests {
 
         assert!(!server.place_block(above_grass, stone), "occupied");
         assert!(ids(&mut near).is_empty());
+    }
+
+    #[test]
+    fn blocks_are_never_placed_inside_any_player() {
+        let server = Server::new(World::new(), Dispatcher::disconnected());
+        // Another player stands in the middle of chunk (0, 0), feet at (8, -60, 8).
+        let (_other, mut other) = join_at(&server, "Other", ChunkPos::new(0, 0));
+        ids(&mut other);
+        let stone = mistvale_protocol::block::BlockState::new("minecraft:stone").network_id();
+
+        // Their feet and their head are both off limits.
+        for occupied in [
+            BlockPos { x: 8, y: -60, z: 8 },
+            BlockPos { x: 8, y: -59, z: 8 },
+        ] {
+            assert!(!server.place_block(occupied, stone), "{occupied:?}");
+            assert_eq!(server.world.block(occupied), server.world.air());
+        }
+        assert!(ids(&mut other).is_empty(), "nothing changed");
+
+        // Beside them and above their head is fine.
+        assert!(server.place_block(BlockPos { x: 9, y: -60, z: 8 }, stone));
+        assert!(server.place_block(BlockPos { x: 8, y: -58, z: 8 }, stone));
     }
 
     fn ids(queue: &mut mpsc::Receiver<Bytes>) -> Vec<u32> {

@@ -45,7 +45,8 @@ use uuid::Uuid;
 
 use crate::inventory;
 use crate::players::{
-    EYE_HEIGHT, Joining, Movement, OUTBOUND_QUEUE, Profile, View, player_metadata,
+    EYE_HEIGHT, Joining, Movement, OUTBOUND_QUEUE, Profile, STANDING_HEIGHT, View, body_overlaps,
+    player_metadata,
 };
 use crate::server::{self, Server};
 use crate::view::ChunkView;
@@ -763,14 +764,9 @@ impl Session {
         if self.break_block(pos).is_none() || self.world.block(pos) != self.world.air() {
             return false;
         }
-        // The player's box: 0.6 wide, 1.8 tall, from their feet.
-        let feet = self.movement.feet();
-        let overlaps =
-            |low: f32, high: f32, block: i32| low < (block + 1) as f32 && high > block as f32;
-        let inside_player = overlaps(feet.x - 0.3, feet.x + 0.3, pos.x)
-            && overlaps(feet.y, feet.y + 1.8, pos.y)
-            && overlaps(feet.z - 0.3, feet.z + 0.3, pos.z);
-        !inside_player
+        // A quick check against the placer's own box, from their latest
+        // input; `Server::place_block` checks every player's.
+        !body_overlaps(self.movement.feet(), STANDING_HEIGHT, pos)
     }
 
     /// A PlayerAction: creative clients report instant breaks this way too.

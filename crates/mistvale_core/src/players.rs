@@ -241,6 +241,19 @@ impl Players {
         }
     }
 
+    /// Whether any player's body overlaps the block at `pos`, so a block
+    /// placed there would trap them.
+    pub fn occupies(&self, pos: BlockPos) -> bool {
+        self.online().values().any(|player| {
+            let height = if player.sneaking {
+                SNEAKING_HEIGHT
+            } else {
+                STANDING_HEIGHT
+            };
+            body_overlaps(player.movement.feet(), height, pos)
+        })
+    }
+
     /// Queues an encoded packet for every player whose client has `chunk`.
     pub fn send_to_viewers(&self, chunk: ChunkPos, packet: &Bytes) {
         for online in self.online().values() {
@@ -388,9 +401,22 @@ pub fn player_metadata(name: &str, sneaking: bool) -> EntityMetadata {
     ])
 }
 
+/// Half a player's width: their box is 0.6 blocks wide around their feet.
+const HALF_WIDTH: f32 = 0.3;
+
+/// Whether a player box standing on `feet`, `height` tall, overlaps the block
+/// at `pos`. Touching a face does not count, so standing on a block is fine.
+pub fn body_overlaps(feet: Vec3, height: f32, pos: BlockPos) -> bool {
+    let overlaps =
+        |low: f32, high: f32, block: i32| low < (block + 1) as f32 && high > block as f32;
+    overlaps(feet.x - HALF_WIDTH, feet.x + HALF_WIDTH, pos.x)
+        && overlaps(feet.y, feet.y + height, pos.y)
+        && overlaps(feet.z - HALF_WIDTH, feet.z + HALF_WIDTH, pos.z)
+}
+
 /// A player's height standing and sneaking, in blocks.
-const STANDING_HEIGHT: f32 = 1.8;
-const SNEAKING_HEIGHT: f32 = 1.5;
+pub const STANDING_HEIGHT: f32 = 1.8;
+pub const SNEAKING_HEIGHT: f32 = 1.5;
 
 fn encode(packet: &impl Encode) -> Bytes {
     Bytes::from(packet.encode())
@@ -581,6 +607,54 @@ mod tests {
         steve.swing();
         assert_eq!(ids(&mut alex_queue), [id::ANIMATE]);
         assert!(ids(&mut steve_queue).is_empty());
+    }
+
+    #[test]
+    fn bodies_overlap_blocks_they_are_in_but_not_ones_they_touch() {
+        let feet = Vec3 {
+            x: 8.5,
+            y: -60.0,
+            z: 8.5,
+        };
+        // Feet and head blocks, standing and sneaking.
+        assert!(body_overlaps(
+            feet,
+            STANDING_HEIGHT,
+            BlockPos { x: 8, y: -60, z: 8 }
+        ));
+        assert!(body_overlaps(
+            feet,
+            STANDING_HEIGHT,
+            BlockPos { x: 8, y: -59, z: 8 }
+        ));
+        assert!(body_overlaps(
+            feet,
+            SNEAKING_HEIGHT,
+            BlockPos { x: 8, y: -59, z: 8 }
+        ));
+        // The block stood on, the one above the head, and the neighbours.
+        assert!(!body_overlaps(
+            feet,
+            STANDING_HEIGHT,
+            BlockPos { x: 8, y: -61, z: 8 }
+        ));
+        assert!(!body_overlaps(
+            feet,
+            STANDING_HEIGHT,
+            BlockPos { x: 8, y: -58, z: 8 }
+        ));
+        assert!(!body_overlaps(
+            feet,
+            STANDING_HEIGHT,
+            BlockPos { x: 9, y: -60, z: 8 }
+        ));
+        // Standing near an edge puts the body in two columns.
+        let at_edge = Vec3 { x: 8.9, ..feet };
+        assert!(body_overlaps(
+            at_edge,
+            STANDING_HEIGHT,
+            BlockPos { x: 9, y: -60, z: 8 }
+        ));
     }
 
     #[test]

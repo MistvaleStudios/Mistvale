@@ -661,8 +661,12 @@ DTLS, SCTP, and multi-segment messages both ways.
   - The decode fails soft: an unreadable transaction is ignored.
   - The block goes against the clicked face, and must come from a hotbar slot whose item
     matches the held one. The target must be reachable, in a loaded chunk, air, and not
-    inside the placing player's own box. Other players' boxes are not checked yet.
-  - `Server::place_block` places only into air, checked under the world lock, then sends
+    inside the placing player's own box (a quick check in the session).
+  - `Server::place_block` refuses a block that overlaps **any** online player's box.
+    `Players::occupies` uses a box 0.6 wide and 1.8 tall (1.5 while sneaking); touching a
+    face is fine. A block inside another player traps them, and their client fights it
+    with rapid snapping (found live on 2026-09-26).
+  - Otherwise it places only into air, checked under the world lock. It then sends
     viewers an UpdateBlock and a LevelSoundEvent `place` (sounds are named by string in
     2193).
   - The client places a block before hearing back, so a refused placement is undone: the
@@ -771,7 +775,8 @@ Each step starts only after explicit confirmation.
 | 9 | Entity tracker (AddPlayer and RemoveActor as players enter and leave each other's view), and own-entity metadata with HasGravity so players stop floating | A player returning to a stationary one reappears; players fall after flying | ✅ done 2026-09-26; returning players reappear and players fall after flying (commit `25e21c9`) |
 | 10 | Vanilla movement speed: the player's own UpdateAttributes (`minecraft:movement` 0.1, underwater and lava 0.02, health 20) and UpdateAbilities (creative abilities; walk 0.1, fly 0.05, vertical fly 1.0) during spawn | Walking feels like vanilla | ✅ done 2026-09-26; walking feels like vanilla (commit `4bce850`) |
 | 11 | Mutable world and block breaking: `World` keeps changed columns; breaks from PlayerAuthInput block actions (StartBreak, PredictDestroyBlock) and PlayerAction (CreativeDestroyBlock), checked for height, reach and loaded chunk; UpdateBlock to every player with the chunk | Broken blocks stay broken, for everyone, and after walking away and back | ✅ done 2026-09-26; breaks persist and sync across clients (commit `e9ebff0`) |
-| 12 | Block placing and feedback: a hotbar of 9 vanilla blocks (a partial ItemRegistry with vanilla item IDs, InventoryContent at spawn), ClickBlock from InventoryTransaction placed against the clicked face (reach, air, not inside the placer; refusals undone with UpdateBlock), UpdateBlock plus the `place` sound; break particles (LevelEvent 2001); arm swings (Animate); sneaking (SetActorData) | Blocks can be placed and everyone sees and hears building; swings and crouching show | 🧪 ready for a live test (2026-09-26) |
+| 12 | Block placing and feedback: a hotbar of 9 vanilla blocks (a partial ItemRegistry with vanilla item IDs, InventoryContent at spawn), ClickBlock from InventoryTransaction placed against the clicked face (reach, air, not inside the placer; refusals undone with UpdateBlock), UpdateBlock plus the `place` sound; break particles (LevelEvent 2001); arm swings (Animate); sneaking (SetActorData) | Blocks can be placed and everyone sees and hears building; swings and crouching show | ✅ done 2026-09-26; hotbar, placing, particles, sounds, swings and sneaking work (commit `c3a895b`) |
+| 13 | Placement never overlaps a player: every online player's box is checked, and refusals are rolled back | A block cannot be placed where another player stands | 🧪 ready for a live test (2026-09-26) |
 
 Later steps are proposed but not yet scheduled:
 - player auth (JWKS verification of the multiplayer token)
