@@ -8,7 +8,9 @@
 //! - `MISTVALE_ADVERTISE_IPS`: comma-separated public addresses to offer clients
 //! - `MISTVALE_ICE_LITE`: `false` switches from ICE-lite to full ICE (default `true`)
 //!
-//! `MISTVALE_WORLD_DIR` sets where the world is saved (default `world`).
+//! `MISTVALE_WORLD_DIR` sets where the world is saved (default `world`), and
+//! `MISTVALE_AUTHENTICATION=false` turns off checking players' sign-in (offline
+//! testing only: anyone can then join as anyone).
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -16,6 +18,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use mistvale_core::auth::Authenticator;
 use mistvale_core::server::{self, PLUGIN_ACTION_QUEUE, Server};
 use mistvale_core::session;
 use mistvale_core::tick::TickLoop;
@@ -54,7 +57,15 @@ async fn main() -> anyhow::Result<()> {
         saved_chunks = world.saved_chunks(),
         "world loaded"
     );
-    let server = Arc::new(Server::new(world, plugins.dispatcher()));
+    let authenticator = if env_value::<bool>("MISTVALE_AUTHENTICATION")?.unwrap_or(true) {
+        Authenticator::online().context("failed to set up player authentication")?
+    } else {
+        tracing::warn!(
+            "player authentication is OFF: anyone can join as anyone. Only use this for offline testing"
+        );
+        Authenticator::offline()
+    };
+    let server = Arc::new(Server::new(world, plugins.dispatcher(), authenticator));
     tokio::spawn(server::apply_plugin_actions(
         Arc::clone(&server),
         plugin_actions,

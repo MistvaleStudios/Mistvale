@@ -31,6 +31,11 @@ base64 = "0.23.1"
 p384 = "0.14.0"
 sha2 = "0.11.0"
 
+# Player authentication: RS256 signatures of multiplayer tokens (the AWS-LC build
+# str0m already uses) and HTTPS to fetch the signing keys (rustls on the same crypto).
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm", "ring-io"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+
 # Player UUIDs (vanilla derives them from the XUID with MD5, as version 3 UUIDs)
 md-5 = "0.11.0"
 uuid = { version = "1.26.1", features = ["v4"] }

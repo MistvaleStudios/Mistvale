@@ -7,7 +7,9 @@
 
 use std::time::Duration;
 
+pub mod auth;
 pub mod inventory;
+pub mod logins;
 pub mod players;
 pub mod server;
 pub mod session;

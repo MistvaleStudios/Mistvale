@@ -167,6 +167,7 @@ impl DisconnectReason {
     pub const NOT_AUTHENTICATED: Self = Self(46);
     pub const UNEXPECTED_PACKET: Self = Self(49);
     pub const KICKED: Self = Self(55);
+    pub const LOGGED_IN_OTHER_LOCATION: Self = Self(43);
     pub const RESOURCE_PACK_PROBLEM: Self = Self(58);
     pub const BAD_PACKET: Self = Self(90);
 }

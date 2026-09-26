@@ -113,17 +113,7 @@ impl ConnectionRequest {
     /// from the last certificate in the legacy chain.
     pub fn identity(&self) -> Result<IdentityClaims, LoginError> {
         if !self.token.is_empty() {
-            let claims = jwt_claims(&self.token)?;
-            let xuid = text_claim(&claims, "xid");
-            // Offline logins carry their UUID; otherwise it comes from the XUID.
-            let identity =
-                uuid_claim(&claims, "leguuid").or_else(|| xuid.as_deref().map(identity_from_xuid));
-            return Ok(IdentityClaims {
-                xuid,
-                display_name: text_claim(&claims, "xname"),
-                identity,
-                public_key: claims.get("cpk").cloned(),
-            });
+            return Ok(IdentityClaims::from_token_claims(&jwt_claims(&self.token)?));
         }
         let certificate = self
             .chain
@@ -152,16 +142,62 @@ pub fn identity_from_xuid(xuid: &str) -> Uuid {
 
 /// Decodes a JWT's claims without checking its signature.
 fn jwt_claims(token: &str) -> Result<Value, LoginError> {
-    let mut parts = token.split('.');
-    let (Some(_header), Some(claims), Some(_signature), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return Err(LoginError::Malformed("not a compact JWT"));
-    };
-    let claims = URL_SAFE_NO_PAD_INDIFFERENT
-        .decode(claims)
-        .map_err(|_| LoginError::Malformed("JWT claims are not base64url"))?;
-    Ok(serde_json::from_slice(&claims)?)
+    Ok(Jwt::parse(token)?.claims)
+}
+
+impl IdentityClaims {
+    /// The identity in a multiplayer token's claims: `xid`, `xname`, `cpk`,
+    /// and the UUID (the offline `leguuid`, or else derived from the XUID).
+    pub fn from_token_claims(claims: &Value) -> Self {
+        let xuid = text_claim(claims, "xid");
+        let identity =
+            uuid_claim(claims, "leguuid").or_else(|| xuid.as_deref().map(identity_from_xuid));
+        Self {
+            xuid,
+            display_name: text_claim(claims, "xname"),
+            identity,
+            public_key: claims.get("cpk").cloned(),
+        }
+    }
+}
+
+/// A compact JWS/JWT taken apart for checking its signature. Parsing verifies
+/// nothing: the signature covers `signing_input` and must be checked by the
+/// caller before trusting `claims`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Jwt {
+    pub header: Value,
+    pub claims: Value,
+    /// `base64url(header).base64url(claims)`, the bytes the signature covers.
+    pub signing_input: String,
+    pub signature: Vec<u8>,
+}
+
+impl Jwt {
+    pub fn parse(token: &str) -> Result<Self, LoginError> {
+        let mut parts = token.split('.');
+        let (Some(header), Some(claims), Some(signature), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(LoginError::Malformed("not a compact JWT"));
+        };
+        let decode = |part: &str, what: &'static str| {
+            URL_SAFE_NO_PAD_INDIFFERENT
+                .decode(part)
+                .map_err(|_| LoginError::Malformed(what))
+        };
+        Ok(Self {
+            header: serde_json::from_slice(&decode(header, "JWT header is not base64url")?)?,
+            claims: serde_json::from_slice(&decode(claims, "JWT claims are not base64url")?)?,
+            signing_input: format!("{header}.{claims}"),
+            signature: decode(signature, "JWT signature is not base64url")?,
+        })
+    }
+
+    /// A text field of the header, such as `alg` or `kid`.
+    pub fn header_field(&self, name: &str) -> Option<&str> {
+        self.header.get(name).and_then(Value::as_str)
+    }
 }
 
 fn text_claim(claims: &Value, name: &str) -> Option<String> {

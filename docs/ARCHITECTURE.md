@@ -555,7 +555,7 @@ DTLS, SCTP, and multi-segment messages both ways.
   when implementing core.
 - **Sessions (implemented):** `session::Session` is a sans-IO state machine for the §3.5
   login and the §3.5.1 spawn. Its stages are RequestNetworkSettings → Login →
-  ResourcePacks → Spawning → Initializing → InGame. It returns replies to send,
+  Authenticating → ResourcePacks → Spawning → Initializing → InGame. It returns replies to send,
   compression to enable afterwards, and whether to close. `session::run` drives it over a
   NetherNet `Connection`.
   - Before the player is in the world, any protocol error ends with a Disconnect **with a
@@ -567,6 +567,36 @@ DTLS, SCTP, and multi-segment messages both ways.
     rotation (in game only; non-finite values are ignored), and `Chat(message)`.
   - Each session gets its own entity ID from `Players::allocate_entity_id` (runtime ID =
     unique ID), used in its StartGame and by everyone who sees the player.
+  - `session::run` handles each batch's packets in order from a queue of replies, so a
+    reply can queue the next. Plugins hear `player_join` 750 ms (15 ticks) after the
+    player spawns: messages that arrive while the client's HUD is still starting are
+    shown twice.
+- **Authentication (implemented):** `auth::Authenticator` verifies the multiplayer token
+  in each Login, as gophertunnel does.
+  - The token is a JWT from `https://authorization.franchise.minecraft-services.net/`,
+    signed with RS256. The server checks the signature against the service's published
+    keys (the OpenID configuration's `jwks_uri`, looked up by `kid`), then the issuer, the
+    audience `api://auth-minecraft-services/multiplayer`, and `exp` and `nbf` with 60 s of
+    clock slack. The token must name a player (`xid` and `xname`).
+  - Keys are fetched on the first login and cached. An unknown `kid` refetches (at most
+    once a minute), and keys are refetched after 6 h. Stale keys keep working if the
+    service is unreachable.
+  - Crypto and TLS add no new stack: RSA uses the AWS-LC build str0m already brings
+    (`aws-lc-rs`, plus its `ring-io` accessors), and `reqwest` 0.13 uses rustls on the
+    same AWS-LC with the OS certificate store.
+  - The session waits in **Authenticating** while `run` awaits the verdict, then
+    `Session::authenticated` continues. Only a verified token's identity is used: the
+    XUID-derived UUID and the gamertag become the player's name and UUID for saves,
+    other players and plugins.
+  - The replay check (the token's `cpk` must be the key proven during signaling) runs on
+    the verified key. A failure disconnects with NotAuthenticated (46), showing why.
+  - `MISTVALE_AUTHENTICATION=false` switches to offline mode, which trusts every token,
+    for testing without internet access. The server warns when it starts this way.
+- **One session per player (implemented):** a verified login claims its UUID in
+  `logins::Logins`. A newer login for the same UUID sends the older session a kick. That
+  session shows "You logged in from another location" (reason 43,
+  LoggedInOtherLocation), saves its player and closes. The claim is released when its
+  session ends, unless a newer session holds it.
 - **Players and chat (implemented):** `server::Server` holds the world, the
   `players::Players` registry and the plugin `Dispatcher`. Each session has a bounded
   queue (256 packets) that `run` drains alongside the connection, batching whatever is
@@ -824,7 +854,8 @@ Each step starts only after explicit confirmation.
 | 13 | Placement never overlaps a player: every online player's box is checked, and refusals are rolled back | A block cannot be placed where another player stands | ✅ done 2026-09-26; blocks vanish when placed inside another player (commit `8e8e1c4`) |
 | 14 | World persistence: changed chunks saved as one compressed file each under `world/chunks/`, every 5 s from the tick loop and on shutdown; loaded the first time a chunk is used, generated otherwise | Builds survive a server restart | ✅ done 2026-09-26; builds survive restarts (commit `0fdbf88`) |
 | 15 | Player persistence and spawn: `players/<uuid>.json` (feet position and rotation) saved on leave, every 5 s and at shutdown, restored at login; new players spawn at (0, -60, 0); broadcasts logged under the `chat` target | Rejoining puts you where you left; new players start at 0, 0 | ✅ done 2026-09-26; position and view direction restore on rejoin |
-| 16 | Flying state saved and restored (UpdateAbilities answers StartFlying and StopFlying); storage behind the `WorldStorage` trait with chunk format v2 (palettes of block names and states; v1 still read); server broadcasts as System text | Leaving while flying, you rejoin in the air; old and new chunk files load | 🧪 ready for a live test (2026-09-26) |
+| 16 | Flying state saved and restored (UpdateAbilities answers StartFlying and StopFlying); storage behind the `WorldStorage` trait with chunk format v2 (palettes of block names and states; v1 still read); server broadcasts as System text | Leaving while flying, you rejoin in the air; old and new chunk files load | ✅ done 2026-09-26; flying, spawn and old chunk files all work (commit `e816e16`) |
+| 17 | Authentication: Login tokens verified (RS256 against the authorization service's published keys; issuer, audience and lifetime checked) before the login continues; the verified UUID is used everywhere; a second login for the same UUID kicks the older session (reason 43, "logged in from another location") | A signed-in client joins; a second device on the same account kicks the first; a forged token is refused | ✅ done 2026-09-26; a signed-in PC and Android client joined, and a second login on the same account showed the first "logged in from another location" |
 
 Later steps are proposed but not yet scheduled:
 - player auth (JWKS verification of the multiplayer token)
@@ -892,12 +923,16 @@ Later steps are proposed but not yet scheduled:
   worked for spawning, but held items might not render or be usable. The hotbar blocks
   are also assumed to have no block states in 26.51. If one shows as an unknown block,
   its state hash is wrong.
-- **Players are not authenticated yet.** We verify that the offer's `cpk` key signed its
-  DTLS fingerprints, which binds the session to that key. We do not yet verify the
-  GameServerToken's RS256 signature against the Minecraft auth service JWKS, so the
-  claimed identity is unproven. The discovery URL, issuer and JWKS still need to be
-  confirmed. Until then the name and UUID plugins see are claims, and must not guard
-  permissions. A second login with the same UUID is not kicked yet either.
+- **Players are authenticated (resolved 2026-09-26).** Login tokens
+  are verified against the Minecraft authorization service (§4.5, Authentication). The
+  offer's `cpk` signing its DTLS fingerprints binds the connection to the verified key.
+  Remaining gaps:
+  - The NetherNet signaling token itself is not verified separately; the Login token
+    covers the same identity and must carry the same key.
+  - With `MISTVALE_AUTHENTICATION=false` nothing is verified, and anyone can join as
+    anyone.
+  - Issuer and key URLs are constants, not read from the discovery document gophertunnel
+    uses. If Mojang moves the service, they need updating.
 - **Send segment size.** str0m's direct API caps what we send at 64 KiB per SCTP message
   (§3.4). That is valid NetherNet, but smaller than BDS's 256 KiB. It could be lifted
   upstream or by switching engines.

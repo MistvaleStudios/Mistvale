@@ -11,6 +11,8 @@ use mistvale_protocol::types::{BlockPos, ChunkPos, Vec3};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::auth::Authenticator;
+use crate::logins::Logins;
 use crate::players::Players;
 use crate::storage::SavedPlayer;
 use crate::world::World;
@@ -26,16 +28,22 @@ pub struct Server {
     pub world: Arc<World>,
     pub players: Players,
     pub plugins: Dispatcher,
+    /// Checks that players are who their login says.
+    pub authenticator: Authenticator,
+    /// One session per verified player.
+    pub logins: Logins,
     /// The last tick the game loop ran; 0 before the first.
     tick: AtomicU64,
 }
 
 impl Server {
-    pub fn new(world: World, plugins: Dispatcher) -> Self {
+    pub fn new(world: World, plugins: Dispatcher, authenticator: Authenticator) -> Self {
         Self {
             world: Arc::new(world),
             players: Players::new(),
             plugins,
+            authenticator,
+            logins: Logins::new(),
             tick: AtomicU64::new(0),
         }
     }
@@ -197,7 +205,11 @@ mod tests {
 
     #[test]
     fn broken_blocks_reach_players_who_have_the_chunk() {
-        let server = Server::new(World::new(), Dispatcher::disconnected());
+        let server = Server::new(
+            World::new(),
+            Dispatcher::disconnected(),
+            Authenticator::offline(),
+        );
         let (_near, mut near) = join_at(&server, "Near", ChunkPos::new(0, 0));
         let (_far, mut far) = join_at(&server, "Far", ChunkPos::new(100, 0));
         while near.try_recv().is_ok() {}
@@ -220,7 +232,11 @@ mod tests {
 
     #[test]
     fn placed_blocks_need_air_and_are_heard() {
-        let server = Server::new(World::new(), Dispatcher::disconnected());
+        let server = Server::new(
+            World::new(),
+            Dispatcher::disconnected(),
+            Authenticator::offline(),
+        );
         let (_near, mut near) = join_at(&server, "Near", ChunkPos::new(0, 0));
         ids(&mut near);
         let stone = mistvale_protocol::block::BlockState::new("minecraft:stone").network_id();
@@ -236,7 +252,11 @@ mod tests {
 
     #[test]
     fn blocks_are_never_placed_inside_any_player() {
-        let server = Server::new(World::new(), Dispatcher::disconnected());
+        let server = Server::new(
+            World::new(),
+            Dispatcher::disconnected(),
+            Authenticator::offline(),
+        );
         // Another player stands in the middle of chunk (0, 0), feet at (8, -60, 8).
         let (_other, mut other) = join_at(&server, "Other", ChunkPos::new(0, 0));
         ids(&mut other);

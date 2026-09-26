@@ -83,11 +83,16 @@ mod tests {
     use mistvale_plugins::Dispatcher;
 
     use super::*;
+    use crate::auth::Authenticator;
     use crate::world::World;
 
     #[test]
     fn ticks_about_twenty_times_a_second_until_dropped() {
-        let server = Arc::new(Server::new(World::new(), Dispatcher::disconnected()));
+        let server = Arc::new(Server::new(
+            World::new(),
+            Dispatcher::disconnected(),
+            Authenticator::offline(),
+        ));
         let ticks = TickLoop::start(Arc::clone(&server)).unwrap();
         thread::sleep(Duration::from_millis(520));
         drop(ticks);

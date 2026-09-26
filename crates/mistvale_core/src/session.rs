@@ -17,6 +17,7 @@
 //!
 //! From then on, chat messages (Text) are relayed to every player.
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +27,7 @@ use mistvale_net::{ClientIdentity, Connection, Reliability};
 use mistvale_plugins::{Event, Player};
 use mistvale_protocol::batch::{self, BatchError, Compression, CompressionAlgorithm};
 use mistvale_protocol::io::DecodeError;
-use mistvale_protocol::login::{ConnectionRequest, LoginError};
+use mistvale_protocol::login::{ConnectionRequest, IdentityClaims, LoginError};
 use mistvale_protocol::nbt::Compound;
 use mistvale_protocol::packet::{self, Encode as _, id};
 use mistvale_protocol::packets::{
@@ -44,6 +45,7 @@ use mistvale_protocol::{GAME_VERSION, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::auth::AuthError;
 use crate::inventory;
 use crate::players::{
     EYE_HEIGHT, Joining, Movement, OUTBOUND_QUEUE, Profile, STANDING_HEIGHT, View, body_overlaps,
@@ -105,6 +107,10 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
     let mut membership = None;
     // The plugin join event, waiting out [`JOIN_EVENT_DELAY`].
     let mut join_event: Option<(Pin<Box<tokio::time::Sleep>>, Player)> = None;
+    // Set once the player's identity is verified: the one session for that
+    // UUID. A newer login for the same player sends a kick.
+    let (kick, mut kicks) = mpsc::channel::<String>(1);
+    let mut login_claim = None;
 
     loop {
         tokio::select! {
@@ -113,18 +119,25 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                     tracing::debug!(network_id, "client closed the connection");
                     return;
                 };
-                let replies = match batch::decode(&message.payload, compression.is_some()) {
-                    Ok(packets) => packets
-                        .iter()
-                        .map(|packet| {
-                            session
-                                .handle(packet)
-                                .unwrap_or_else(|err| err.into_reply())
-                        })
-                        .collect(),
-                    Err(err) => vec![SessionError::from(err).into_reply()],
+                // Packets are handled in order; a reply may queue another, such
+                // as the login continuing once its token is verified.
+                let mut pending = VecDeque::new();
+                let packets = match batch::decode(&message.payload, compression.is_some()) {
+                    Ok(packets) => packets,
+                    Err(err) => {
+                        pending.push_back(SessionError::from(err).into_reply());
+                        Vec::new()
+                    }
                 };
-                for reply in replies {
+                let mut packets = packets.iter();
+                loop {
+                    let reply = match pending.pop_front() {
+                        Some(reply) => reply,
+                        None => match packets.next() {
+                            Some(packet) => session.handle(packet).unwrap_or_else(|err| err.into_reply()),
+                            None => break,
+                        },
+                    };
                     let packets = reply.packets.iter().map(Vec::as_slice);
                     if !send(connection, packets, compression).await {
                         return;
@@ -134,6 +147,14 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                     }
                     for event in reply.events {
                         match event {
+                            SessionEvent::Authenticate(token) => {
+                                let result = server.authenticator.verify(&token).await;
+                                pending.push_back(session.authenticated(result));
+                            }
+                            SessionEvent::LoggedIn(uuid) => {
+                                // Kicks this player's older session, if any.
+                                login_claim = Some(server.logins.claim(uuid, kick.clone()));
+                            }
                             SessionEvent::Joined { profile, movement, view } => {
                                 let player = Player {
                                     name: profile.name.clone(),
@@ -202,6 +223,15 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                     }
                 }
             }
+            Some(message) = kicks.recv() => {
+                // A newer login for this player: this session gives way.
+                let reply = Reply::disconnect(DisconnectReason::LOGGED_IN_OTHER_LOCATION, message);
+                let _ = send(connection, reply.packets.iter().map(Vec::as_slice), compression).await;
+                drop(membership.take());
+                drop(login_claim.take());
+                linger(connection).await;
+                return;
+            }
             () = async { join_event.as_mut().expect("guarded").0.as_mut().await }, if join_event.is_some() => {
                 let (_, player) = join_event.take().expect("guarded");
                 server.plugins.dispatch(Event::PlayerJoin(player));
@@ -265,6 +295,11 @@ pub struct Reply {
 /// Something a session did that matters beyond its own client.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionEvent {
+    /// The Login's multiplayer token needs verifying; the result goes to
+    /// [`Session::authenticated`].
+    Authenticate(String),
+    /// The player's verified identity: they hold this UUID from now on.
+    LoggedIn(Uuid),
     /// The player finished spawning and is in the world.
     Joined {
         profile: Profile,
@@ -319,6 +354,8 @@ impl Reply {
 pub enum Stage {
     RequestNetworkSettings,
     Login,
+    /// Login is received; waiting for its token to be verified.
+    Authenticating,
     ResourcePacks,
     /// StartGame is sent; waiting for the client's view distance.
     Spawning,
@@ -500,9 +537,33 @@ impl Session {
         })
     }
 
+    /// Reads the connection request and asks for its multiplayer token to be
+    /// verified; [`Session::authenticated`] continues with the result.
     fn login(&mut self, login: Login) -> Result<Reply, SessionError> {
         let request = ConnectionRequest::parse(&login.connection_request)?;
-        let claims = request.identity()?;
+        self.stage = Stage::Authenticating;
+        Ok(Reply {
+            events: vec![SessionEvent::Authenticate(request.token)],
+            ..Reply::default()
+        })
+    }
+
+    /// Continues the login with the verified identity from the multiplayer
+    /// token, or disconnects a player who could not be verified.
+    pub fn authenticated(&mut self, result: Result<IdentityClaims, AuthError>) -> Reply {
+        if self.stage != Stage::Authenticating {
+            return Reply::default();
+        }
+        let claims = match result {
+            Ok(claims) => claims,
+            Err(err) => {
+                tracing::info!(%err, "rejecting a player who could not be authenticated");
+                return Reply::disconnect(
+                    DisconnectReason::NOT_AUTHENTICATED,
+                    format!("Mistvale BDS: could not verify your Microsoft account.\n{err}"),
+                );
+            }
+        };
 
         // NetherNet has no game-level encryption, so a captured Login could be
         // replayed on another connection. The Login must carry the key this
@@ -518,39 +579,41 @@ impl Session {
                     xuid = ?claims.xuid,
                     "Login key does not match the key proven during signaling"
                 );
-                return Ok(Reply::disconnect(
+                return Reply::disconnect(
                     DisconnectReason::NOT_AUTHENTICATED,
                     "Mistvale BDS: your login does not match this connection.",
-                ));
+                );
             }
         }
 
+        // Verified tokens always name the player; the fallbacks only apply to
+        // unchecked tokens in offline mode.
         self.uuid = claims.identity.unwrap_or_else(|| {
             tracing::debug!("login has no persistent identity; using a random UUID");
             Uuid::new_v4()
         });
+        self.player = claims
+            .display_name
+            .unwrap_or_else(|| String::from("Player"));
         // Returning players start where they left.
         if let Some(saved) = self.world.load_player(self.uuid) {
             self.movement = Movement::from_saved(&saved);
             self.flying = saved.flying;
             tracing::debug!(uuid = %self.uuid, ?saved, "restored the player's position");
         }
-        tracing::info!(
-            name = ?claims.display_name,
-            uuid = %self.uuid,
-            "player logged in (identity not verified yet)"
-        );
-        if let Some(name) = claims.display_name {
-            self.player = name;
-        }
+        tracing::info!(name = %self.player, uuid = %self.uuid, "player logged in");
         self.stage = Stage::ResourcePacks;
-        Ok(Reply::send(vec![
-            PlayStatus {
-                status: PlayStatusCode::LoginSuccess,
-            }
-            .encode(),
-            ResourcePacksInfo::default().encode(),
-        ]))
+        Reply {
+            packets: vec![
+                PlayStatus {
+                    status: PlayStatusCode::LoginSuccess,
+                }
+                .encode(),
+                ResourcePacksInfo::default().encode(),
+            ],
+            events: vec![SessionEvent::LoggedIn(self.uuid)],
+            ..Reply::default()
+        }
     }
 
     fn pack_response(
@@ -1096,6 +1159,63 @@ mod tests {
         .encode()
     }
 
+    /// Sends a Login and answers its authentication request as offline
+    /// verification would, with the token's own claims. Returns the reply
+    /// that continues the login.
+    fn log_in(session: &mut Session, token: String) -> Reply {
+        let reply = session.handle(&login_packet(token.clone())).unwrap();
+        assert!(
+            reply.packets.is_empty(),
+            "nothing is sent before verification"
+        );
+        assert_eq!(reply.events, [SessionEvent::Authenticate(token.clone())]);
+        assert_eq!(session.stage(), Stage::Authenticating);
+        let claims = mistvale_protocol::login::Jwt::parse(&token).unwrap().claims;
+        session.authenticated(Ok(IdentityClaims::from_token_claims(&claims)))
+    }
+
+    #[test]
+    fn unverified_players_are_disconnected() {
+        let (identity, token) = client();
+        let mut session = session(Some(identity));
+        session
+            .handle(
+                &RequestNetworkSettings {
+                    client_protocol: PROTOCOL_VERSION,
+                }
+                .encode(),
+            )
+            .unwrap();
+        session.handle(&login_packet(token)).unwrap();
+        let reply = session.authenticated(Err(AuthError::BadSignature));
+        assert!(reply.close);
+        let disconnect: Disconnect = decode_only(&reply.packets[0]);
+        assert_eq!(disconnect.reason, DisconnectReason::NOT_AUTHENTICATED);
+        let message = disconnect.message.unwrap().message;
+        assert!(message.contains("signature"), "{message}");
+        assert!(reply.events.is_empty(), "no identity is claimed");
+    }
+
+    #[test]
+    fn a_verified_login_claims_its_uuid() {
+        let (identity, token) = client();
+        let mut session = session(Some(identity));
+        session
+            .handle(
+                &RequestNetworkSettings {
+                    client_protocol: PROTOCOL_VERSION,
+                }
+                .encode(),
+            )
+            .unwrap();
+        let reply = log_in(&mut session, token);
+        let [SessionEvent::LoggedIn(uuid)] = reply.events[..] else {
+            panic!("expected a login, got {:?}", reply.events);
+        };
+        assert_eq!(uuid, session.uuid);
+        assert!(!uuid.is_nil());
+    }
+
     fn pack_response(response: PackResponse) -> Vec<u8> {
         ResourcePackClientResponse { response }.encode()
     }
@@ -1122,7 +1242,7 @@ mod tests {
             client_protocol: PROTOCOL_VERSION,
         };
         session.handle(&request.encode()).unwrap();
-        session.handle(&login_packet(token)).unwrap();
+        log_in(&mut session, token);
         session
             .handle(&pack_response(PackResponse::DownloadingFinished))
             .unwrap();
@@ -1154,7 +1274,7 @@ mod tests {
             CompressionAlgorithm::Flate.id()
         );
 
-        let reply = session.handle(&login_packet(token)).unwrap();
+        let reply = log_in(&mut session, token);
         assert_eq!(ids(&reply), [id::PLAY_STATUS, id::RESOURCE_PACKS_INFO]);
         let status: PlayStatus = decode_only(&reply.packets[0]);
         assert_eq!(status.status, PlayStatusCode::LoginSuccess);
@@ -1291,11 +1411,11 @@ mod tests {
             )
             .unwrap();
 
-        let reply = session.handle(&login_packet(other_token)).unwrap();
+        let reply = log_in(&mut session, other_token);
         assert!(reply.close);
         let disconnect: Disconnect = decode_only(&reply.packets[0]);
         assert_eq!(disconnect.reason, DisconnectReason::NOT_AUTHENTICATED);
-        assert_eq!(session.stage(), Stage::Login);
+        assert_eq!(session.stage(), Stage::Authenticating);
     }
 
     #[test]
@@ -1509,7 +1629,7 @@ mod tests {
             )
             .unwrap();
         let (_, token) = client();
-        session.handle(&login_packet(token)).unwrap();
+        log_in(&mut session, token);
         session
             .handle(&pack_response(PackResponse::DownloadingFinished))
             .unwrap();

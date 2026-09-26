@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use mistvale_core::auth::Authenticator;
 use mistvale_core::players::{EYE_HEIGHT, Joining, Movement, Profile, View};
 use mistvale_core::server::{self, PLUGIN_ACTION_QUEUE, Server};
 use mistvale_core::world::World;
@@ -26,7 +27,11 @@ async fn the_sample_plugin_welcomes_a_joining_player_once() {
         ..PluginConfig::default()
     };
     let plugins = PluginHost::start(config, actions).unwrap();
-    let server = Arc::new(Server::new(World::new(), plugins.dispatcher()));
+    let server = Arc::new(Server::new(
+        World::new(),
+        plugins.dispatcher(),
+        Authenticator::offline(),
+    ));
     tokio::spawn(server::apply_plugin_actions(
         Arc::clone(&server),
         plugin_actions,
