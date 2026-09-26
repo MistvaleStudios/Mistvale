@@ -239,6 +239,15 @@ impl Players {
         }
     }
 
+    /// Queues an encoded packet for every player whose client has `chunk`.
+    pub fn send_to_viewers(&self, chunk: ChunkPos, packet: &Bytes) {
+        for online in self.online().values() {
+            if online.view.contains(chunk) {
+                online.send(packet.clone());
+            }
+        }
+    }
+
     /// Shows `message` in every player's chat.
     pub fn broadcast_message(&self, message: &str) {
         if message.is_empty() || message.len() > Text::MAX_MESSAGE_LEN {

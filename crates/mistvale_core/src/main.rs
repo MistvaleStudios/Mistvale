@@ -16,7 +16,7 @@ use anyhow::Context as _;
 use mistvale_core::server::{self, PLUGIN_ACTION_QUEUE, Server};
 use mistvale_core::session;
 use mistvale_core::tick::TickLoop;
-use mistvale_core::world::FlatWorld;
+use mistvale_core::world::World;
 use mistvale_net::{Connection, Listener, ListenerConfig, ServerStatus};
 use mistvale_plugins::{PluginConfig, PluginHost};
 use tokio::sync::mpsc;
@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
     let plugins = PluginHost::start(PluginConfig::default(), actions)
         .context("failed to start the plugin host")?;
     tracing::info!(loaded = ?plugins.loaded(), "plugins ready");
-    let server = Arc::new(Server::new(FlatWorld::new(), plugins.dispatcher()));
+    let server = Arc::new(Server::new(World::new(), plugins.dispatcher()));
     tokio::spawn(server::apply_plugin_actions(
         Arc::clone(&server),
         plugin_actions,

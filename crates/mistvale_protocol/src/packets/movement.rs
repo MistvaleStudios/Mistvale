@@ -2,6 +2,7 @@
 
 use crate::io::{DecodeError, Reader, Writer};
 use crate::packet::{Decode, Encode, Packet, id};
+use crate::packets::BlockAction;
 use crate::types::{Vec2, Vec3};
 
 /// Most input flags a PlayerAuthInput may list; the protocol defines about 65.
@@ -10,8 +11,10 @@ const MAX_INPUT_FLAGS: u32 = 128;
 /// What the client did this tick, sent every client tick (20 per second) once
 /// it is in the world, even while standing still.
 ///
-/// Only the leading fields are decoded. After `delta` come item interactions,
-/// item stack requests, block actions and vehicle data, which are skipped.
+/// Decoded up to the block actions. Before them come an optional item
+/// interaction, which is stepped over, and an optional item stack request,
+/// which cannot be yet: when one is present the block actions are unreachable
+/// and `block_actions_unread` is set. Vehicle data after them is skipped.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerAuthInput {
     pub pitch: f32,
@@ -20,8 +23,9 @@ pub struct PlayerAuthInput {
     pub position: Vec3,
     pub move_vector: Vec2,
     pub head_yaw: f32,
-    /// IDs of the input flags set this tick (sneaking, jumping, collisions…).
-    /// Kept raw: Mojang's schema and gophertunnel number them differently.
+    /// IDs of the input flags set this tick (sneaking, jumping, collisions…),
+    /// numbered as in gophertunnel. Mojang's enum omits a few values, but the
+    /// bit numbers in its descriptions match gophertunnel's.
     pub input_flags: Vec<i32>,
     pub input_mode: u32,
     pub play_mode: u32,
@@ -31,6 +35,10 @@ pub struct PlayerAuthInput {
     pub tick: u64,
     /// How far the player moved this tick.
     pub delta: Vec3,
+    /// Block breaking progress this tick, with server-authoritative breaking.
+    pub block_actions: Vec<BlockAction>,
+    /// An item stack request hid this tick's block actions; see above.
+    pub block_actions_unread: bool,
 }
 
 impl Packet for PlayerAuthInput {
@@ -54,7 +62,7 @@ impl Decode for PlayerAuthInput {
         let input_flags = (0..count)
             .map(|_| reader.var_i32())
             .collect::<Result<_, _>>()?;
-        let input = Self {
+        let mut input = Self {
             pitch,
             yaw,
             position,
@@ -67,11 +75,115 @@ impl Decode for PlayerAuthInput {
             interact_rotation: Vec2::read(reader)?,
             tick: reader.var_u64()?,
             delta: Vec3::read(reader)?,
+            block_actions: Vec::new(),
+            block_actions_unread: false,
         };
-        // Skip the optional trailing fields.
+        // The rest is optional. Reading it must never cost the movement above,
+        // so a tail that cannot be parsed only leaves the block actions unread.
+        match read_block_actions(&mut reader.clone()) {
+            Ok(Some(actions)) => input.block_actions = actions,
+            Ok(None) | Err(_) => input.block_actions_unread = true,
+        }
         reader.take(reader.remaining())?;
         Ok(input)
     }
+}
+
+/// Reads past the item interaction to the block actions. `None` when an item
+/// stack request stands in the way.
+fn read_block_actions(reader: &mut Reader<'_>) -> Result<Option<Vec<BlockAction>>, DecodeError> {
+    if reader.bool()? {
+        skip_item_use_transaction(reader)?;
+    }
+    if reader.bool()? {
+        return Ok(None);
+    }
+    if !reader.bool()? {
+        return Ok(Some(Vec::new()));
+    }
+    let count = reader.var_u32()?;
+    if count > MAX_BLOCK_ACTIONS {
+        return Err(DecodeError::InvalidValue {
+            field: "block action count",
+            value: count.into(),
+        });
+    }
+    (0..count)
+        .map(|_| BlockAction::read(reader))
+        .collect::<Result<_, _>>()
+        .map(Some)
+}
+
+/// Most block actions a PlayerAuthInput may carry.
+const MAX_BLOCK_ACTIONS: u32 = 64;
+
+/// Most entries in any list inside an item interaction.
+const MAX_LIST: u32 = 256;
+
+fn list_len(reader: &mut Reader<'_>, field: &'static str) -> Result<u32, DecodeError> {
+    let count = reader.var_u32()?;
+    if count > MAX_LIST {
+        return Err(DecodeError::InvalidValue {
+            field,
+            value: count.into(),
+        });
+    }
+    Ok(count)
+}
+
+/// Steps over an item-use transaction (placing, using an item on a block),
+/// as laid out by gophertunnel's `PlayerInventoryAction`.
+fn skip_item_use_transaction(reader: &mut Reader<'_>) -> Result<(), DecodeError> {
+    // Legacy request ID, then optional legacy slots: container ID and slot bytes.
+    reader.var_i32()?;
+    if reader.bool()? {
+        for _ in 0..list_len(reader, "legacy slot count")? {
+            reader.u8()?;
+            reader.byte_array()?;
+        }
+    }
+    // Inventory actions: source type, optional window ID and flags, slot, items.
+    for _ in 0..list_len(reader, "inventory action count")? {
+        reader.var_u32()?;
+        if reader.bool()? {
+            reader.u8()?;
+        }
+        if reader.bool()? {
+            reader.var_u32()?;
+        }
+        reader.var_u32()?;
+        skip_item_instance(reader)?;
+        skip_item_instance(reader)?;
+    }
+    // Action and trigger type, block position and face, hotbar slot, hand,
+    // held item, positions, block runtime ID, prediction and cooldown state.
+    reader.var_i32()?;
+    reader.u8()?;
+    crate::types::BlockPos::read(reader)?;
+    reader.u8()?;
+    reader.var_i32()?;
+    reader.u8()?;
+    skip_item_instance(reader)?;
+    Vec3::read(reader)?;
+    Vec3::read(reader)?;
+    reader.var_u32()?;
+    reader.u8()?;
+    reader.u8()?;
+    Ok(())
+}
+
+/// Steps over an item instance: network ID, count, metadata, optional stack
+/// network ID, block runtime ID and the user data blob.
+fn skip_item_instance(reader: &mut Reader<'_>) -> Result<(), DecodeError> {
+    reader.u16_le()?;
+    reader.u16_le()?;
+    reader.var_u32()?;
+    if reader.bool()? {
+        reader.var_i32()?;
+    }
+    reader.var_u32()?;
+    reader.byte_array()?;
+    Ok(())
 }
 
 impl Encode for PlayerAuthInput {
@@ -93,11 +205,19 @@ impl Encode for PlayerAuthInput {
         self.interact_rotation.write(writer);
         writer.var_u64(self.tick);
         self.delta.write(writer);
-        // No item interaction, item stack request, block actions, vehicle
-        // rotation or predicted vehicle.
-        for _ in 0..5 {
-            writer.bool(false);
+        // No item interaction or item stack request.
+        writer.bool(false);
+        writer.bool(false);
+        writer.bool(!self.block_actions.is_empty());
+        if !self.block_actions.is_empty() {
+            writer.var_u32(u32::try_from(self.block_actions.len()).expect("a few actions"));
+            for action in &self.block_actions {
+                action.write(writer);
+            }
         }
+        // No vehicle rotation or predicted vehicle.
+        writer.bool(false);
+        writer.bool(false);
         // Analogue move vector, camera orientation and raw move vector.
         Vec2::default().write(writer);
         Vec3::default().write(writer);
@@ -178,7 +298,82 @@ mod tests {
                 y: 0.0,
                 z: 0.2,
             },
+            block_actions: Vec::new(),
+            block_actions_unread: false,
         }
+    }
+
+    /// The fields up to `delta`, then `tail` as the optional part.
+    fn with_tail(tail: &[u8]) -> Vec<u8> {
+        let mut bytes = input().encode();
+        let head = bytes.len() - (5 + 8 + 12 + 8);
+        bytes.truncate(head);
+        bytes.extend(tail);
+        bytes
+    }
+
+    fn decode_input(bytes: &[u8]) -> PlayerAuthInput {
+        let (_, payload) = read_header(bytes).unwrap();
+        decode(payload).unwrap()
+    }
+
+    #[test]
+    fn block_actions_round_trip() {
+        let breaking = PlayerAuthInput {
+            block_actions: vec![BlockAction {
+                action: crate::packets::player_action::PREDICT_DESTROY_BLOCK,
+                position: crate::types::BlockPos { x: 3, y: -61, z: 4 },
+                face: 1,
+            }],
+            ..input()
+        };
+        assert_eq!(decode_input(&breaking.encode()), breaking);
+    }
+
+    #[test]
+    fn block_actions_are_found_behind_an_item_interaction() {
+        let mut tail = vec![0x01];
+        // Legacy request ID 0, no legacy slots, one inventory action.
+        tail.extend([0x00, 0x00, 0x01]);
+        // Source 0, window ID 0, no flags, slot 1, two empty items.
+        tail.extend([0x00, 0x01, 0x00, 0x00, 0x01]);
+        let empty_item = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        tail.extend(empty_item);
+        tail.extend(empty_item);
+        // Action, trigger, block position, face, hotbar slot, hand, held item.
+        tail.extend([0x00, 0x01, 0x10, 0x79, 0x10, 0x01, 0x00, 0x00]);
+        tail.extend(empty_item);
+        // Two positions, block runtime ID, prediction and cooldown.
+        tail.extend([0; 24]);
+        tail.extend([0x00, 0x01, 0x00]);
+        // No item stack request; one block action: start break at (8, -61, 8).
+        tail.extend([0x00, 0x01, 0x01, 0x00, 0x10, 0x79, 0x10, 0x02]);
+        tail.extend([0x00, 0x00]);
+        tail.extend([0; 8 + 12 + 8]);
+
+        let input = decode_input(&with_tail(&tail));
+        assert_eq!(
+            input.block_actions,
+            [BlockAction {
+                action: crate::packets::player_action::START_BREAK,
+                position: crate::types::BlockPos { x: 8, y: -61, z: 8 },
+                face: 1,
+            }]
+        );
+        assert!(!input.block_actions_unread);
+    }
+
+    #[test]
+    fn an_unreadable_tail_keeps_the_movement() {
+        // An item stack request hides the block actions.
+        let input = decode_input(&with_tail(&[0x00, 0x01, 0x05, 0x06]));
+        assert!(input.block_actions_unread);
+        assert_eq!(input.position, super::tests::input().position);
+
+        // So does garbage: an item interaction that ends early.
+        let input = decode_input(&with_tail(&[0x01, 0x00]));
+        assert!(input.block_actions_unread);
+        assert_eq!(input.delta, super::tests::input().delta);
     }
 
     #[test]

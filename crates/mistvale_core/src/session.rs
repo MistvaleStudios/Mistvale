@@ -32,10 +32,10 @@ use mistvale_protocol::packets::{
     AbilityData, AbilityLayer, Attribute, ChunkRadiusUpdated, CreativeContent, Disconnect,
     DisconnectMessage, DisconnectReason, EXEMPTED_PACKS, GameRule, GameRuleValue, ItemRegistry,
     JigsawStructureData, Login, NetworkChunkPublisherUpdate, NetworkSettings, PackResponse,
-    PlayStatus, PlayStatusCode, PlayerAuthInput, PlayerMovementSettings, RequestChunkRadius,
-    RequestNetworkSettings, ResourcePackClientResponse, ResourcePackStack, ResourcePacksInfo,
-    SetActorData, SetLocalPlayerAsInitialized, StackPack, StartGame, Text, TextType,
-    UpdateAbilities, UpdateAttributes, VoxelShapes, ability,
+    PlayStatus, PlayStatusCode, PlayerAction, PlayerAuthInput, PlayerMovementSettings,
+    RequestChunkRadius, RequestNetworkSettings, ResourcePackClientResponse, ResourcePackStack,
+    ResourcePacksInfo, SetActorData, SetLocalPlayerAsInitialized, StackPack, StartGame, Text,
+    TextType, UpdateAbilities, UpdateAttributes, VoxelShapes, ability, player_action,
 };
 use mistvale_protocol::types::{BlockPos, ChunkPos, Vec3};
 use mistvale_protocol::{GAME_VERSION, PROTOCOL_VERSION};
@@ -47,7 +47,7 @@ use crate::players::{
 };
 use crate::server::Server;
 use crate::view::ChunkView;
-use crate::world::{FlatWorld, OVERWORLD};
+use crate::world::{MAX_Y, MIN_Y, OVERWORLD, World};
 
 /// Compression the server asks clients to use.
 const COMPRESSION: Compression = Compression {
@@ -61,6 +61,10 @@ const DISCONNECT_LINGER: Duration = Duration::from_secs(5);
 
 /// Largest view distance granted, in chunks.
 const MAX_VIEW_DISTANCE: i32 = 8;
+
+/// Farthest a player may break a block from, eyes to block centre, in blocks.
+/// Creative reach is about 7.5; the slack covers lag between input and movement.
+const MAX_REACH: f32 = 12.0;
 
 /// Longest chat message relayed, in characters.
 const MAX_CHAT_LENGTH: usize = 512;
@@ -132,6 +136,9 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
                                 if let Some(membership) = &membership {
                                     membership.viewing(view);
                                 }
+                            }
+                            SessionEvent::BrokeBlock(pos) => {
+                                server.break_block(pos);
                             }
                             SessionEvent::Chat(message) => {
                                 server.players.chat(session.player(), &message);
@@ -214,6 +221,8 @@ pub enum SessionEvent {
     Moved(Movement),
     /// The player's client now shows a different set of chunks.
     Viewing(View),
+    /// The player broke the block at this position.
+    BrokeBlock(BlockPos),
     /// The player said something in chat.
     Chat(String),
 }
@@ -304,11 +313,11 @@ pub struct Session {
     view: ChunkView,
     /// Where the player is, as last reported.
     movement: Movement,
-    world: Arc<FlatWorld>,
+    world: Arc<World>,
 }
 
 impl Session {
-    pub fn new(identity: Option<ClientIdentity>, world: Arc<FlatWorld>, entity_id: u64) -> Self {
+    pub fn new(identity: Option<ClientIdentity>, world: Arc<World>, entity_id: u64) -> Self {
         let spawn = world.spawn();
         Self {
             stage: Stage::RequestNetworkSettings,
@@ -362,6 +371,7 @@ impl Session {
             }
             (Stage::InGame, id::TEXT) => Ok(self.text(packet::decode(payload)?)),
             (Stage::InGame, id::PLAYER_AUTH_INPUT) => Ok(self.auth_input(packet::decode(payload)?)),
+            (Stage::InGame, id::PLAYER_ACTION) => Ok(self.player_action(packet::decode(payload)?)),
             (stage, id) if stage.in_world() => {
                 // Movement input starts before the player is initialized.
                 if id != id::PLAYER_AUTH_INPUT {
@@ -647,6 +657,69 @@ impl Session {
     /// Records where the client says its player is. The client is trusted
     /// for now: movement is not validated beyond rejecting non-finite values.
     fn auth_input(&mut self, input: PlayerAuthInput) -> Reply {
+        // Blocks broken this tick, even when the player stands still.
+        if input.block_actions_unread {
+            tracing::debug!(player = %self.player, "block actions hidden behind an item stack request");
+        }
+        let broken: Vec<SessionEvent> = input
+            .block_actions
+            .iter()
+            .filter(|action| {
+                // Everyone is in creative mode, where starting to break a
+                // block breaks it; survival clients finish with a prediction.
+                matches!(
+                    action.action,
+                    player_action::START_BREAK | player_action::PREDICT_DESTROY_BLOCK
+                )
+            })
+            .filter_map(|action| self.break_block(action.position))
+            .collect();
+        let mut reply = self.movement_input(input);
+        reply.events.extend(broken);
+        reply
+    }
+
+    /// A PlayerAction: creative clients report instant breaks this way too.
+    fn player_action(&mut self, action: PlayerAction) -> Reply {
+        let events = match action.action {
+            player_action::CREATIVE_DESTROY_BLOCK => self
+                .break_block(action.block_position)
+                .into_iter()
+                .collect(),
+            _ => Vec::new(),
+        };
+        Reply {
+            events,
+            ..Reply::default()
+        }
+    }
+
+    /// Checks that the player may break the block at `pos`: inside the
+    /// world's height, within reach, and in a chunk their client has.
+    fn break_block(&self, pos: BlockPos) -> Option<SessionEvent> {
+        let centre = Vec3 {
+            x: pos.x as f32 + 0.5,
+            y: pos.y as f32 + 0.5,
+            z: pos.z as f32 + 0.5,
+        };
+        let eyes = self.movement.position;
+        let reach_squared =
+            (centre.x - eyes.x).powi(2) + (centre.y - eyes.y).powi(2) + (centre.z - eyes.z).powi(2);
+        let in_view = self.view.centre().is_some_and(|centre| {
+            View {
+                centre,
+                radius: self.view.radius(),
+            }
+            .contains(ChunkPos::of_block(pos))
+        });
+        if !(MIN_Y..=MAX_Y).contains(&pos.y) || reach_squared > MAX_REACH * MAX_REACH || !in_view {
+            tracing::debug!(player = %self.player, ?pos, "refusing to break an unreachable block");
+            return None;
+        }
+        Some(SessionEvent::BrokeBlock(pos))
+    }
+
+    fn movement_input(&mut self, input: PlayerAuthInput) -> Reply {
         let movement = Movement {
             position: input.position,
             pitch: input.pitch,
@@ -715,7 +788,7 @@ impl Session {
 }
 
 /// StartGame for the flat world: a creative-mode player standing at the spawn.
-fn start_game(world: &FlatWorld, entity_id: u64, movement: &Movement) -> StartGame {
+fn start_game(world: &World, entity_id: u64, movement: &Movement) -> StartGame {
     let spawn = world.spawn();
     StartGame {
         entity_unique_id: i64::try_from(entity_id).expect("entity IDs stay far below i64::MAX"),
@@ -814,6 +887,7 @@ mod tests {
     use mistvale_net::identity::verify_client;
     use mistvale_net::sdp::SdpFingerprint;
     use mistvale_protocol::packet::Decode;
+    use mistvale_protocol::packets::BlockAction;
 
     use super::*;
 
@@ -836,7 +910,7 @@ mod tests {
     }
 
     fn session(identity: Option<ClientIdentity>) -> Session {
-        Session::new(identity, Arc::new(FlatWorld::new()), PLAYER_ENTITY_ID)
+        Session::new(identity, Arc::new(World::new()), PLAYER_ENTITY_ID)
     }
 
     fn login_packet(token: String) -> Vec<u8> {
@@ -1148,6 +1222,10 @@ mod tests {
     }
 
     fn auth_input(position: Vec3, yaw: f32) -> Vec<u8> {
+        breaking_input(position, yaw, Vec::new())
+    }
+
+    fn breaking_input(position: Vec3, yaw: f32, block_actions: Vec<BlockAction>) -> Vec<u8> {
         PlayerAuthInput {
             pitch: 0.0,
             yaw,
@@ -1161,8 +1239,93 @@ mod tests {
             interact_rotation: Default::default(),
             tick: 1,
             delta: Vec3::default(),
+            block_actions,
+            block_actions_unread: false,
         }
         .encode()
+    }
+
+    /// A session whose player is in the world, standing at the spawn.
+    fn in_game_session() -> Session {
+        let mut session = spawning_session();
+        let request = RequestChunkRadius {
+            radius: 4,
+            max_radius: 4,
+        };
+        session.handle(&request.encode()).unwrap();
+        let initialized = SetLocalPlayerAsInitialized {
+            entity_runtime_id: PLAYER_ENTITY_ID,
+        };
+        session.handle(&initialized.encode()).unwrap();
+        session
+    }
+
+    #[test]
+    fn breaks_blocks_in_reach_from_either_packet() {
+        let mut session = in_game_session();
+        let spawn_eyes = Vec3 {
+            x: 8.5,
+            y: -60.0 + EYE_HEIGHT,
+            z: 8.5,
+        };
+        let grass = BlockPos { x: 9, y: -61, z: 8 };
+
+        // Creative clients start breaking in PlayerAuthInput, while standing still.
+        let start = BlockAction {
+            action: player_action::START_BREAK,
+            position: grass,
+            face: 1,
+        };
+        let reply = session
+            .handle(&breaking_input(spawn_eyes, 0.0, vec![start]))
+            .unwrap();
+        assert!(reply.events.contains(&SessionEvent::BrokeBlock(grass)));
+        // Aborting a break breaks nothing.
+        let abort = BlockAction {
+            action: player_action::ABORT_BREAK,
+            ..start
+        };
+        let reply = session
+            .handle(&breaking_input(spawn_eyes, 0.0, vec![abort]))
+            .unwrap();
+        assert!(reply.events.is_empty());
+
+        // And report it in a PlayerAction.
+        let destroy = PlayerAction {
+            entity_runtime_id: PLAYER_ENTITY_ID,
+            action: player_action::CREATIVE_DESTROY_BLOCK,
+            block_position: grass,
+            result_position: BlockPos::default(),
+            face: 1,
+        };
+        let reply = session.handle(&destroy.encode()).unwrap();
+        assert_eq!(reply.events, [SessionEvent::BrokeBlock(grass)]);
+
+        // Out of reach, below the world or in an unloaded chunk: refused.
+        for pos in [
+            BlockPos {
+                x: 30,
+                y: -61,
+                z: 8,
+            },
+            BlockPos { x: 8, y: -65, z: 8 },
+            BlockPos {
+                x: 8,
+                y: -61,
+                z: 900,
+            },
+        ] {
+            let reply = session
+                .handle(
+                    &PlayerAction {
+                        block_position: pos,
+                        ..destroy
+                    }
+                    .encode(),
+                )
+                .unwrap();
+            assert!(reply.events.is_empty(), "{pos:?}");
+        }
     }
 
     /// The chunk coordinates of the LevelChunks in a reply.

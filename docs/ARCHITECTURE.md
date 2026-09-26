@@ -523,6 +523,7 @@ DTLS, SCTP, and multi-segment messages both ways.
 
   | `packets::movement` | PlayerAuthInput, decoded up to the position delta, with the rest skipped; input flags kept as raw IDs, since Mojang's enum and gophertunnel's number them differently. MovePlayer, without teleports. |
   | `packets::entity` | AddPlayer, RemoveActor, PlayerList (a per-entry varuint32 variant plus an action byte), entity metadata, and a classic `Skin` |
+  | `packets::block` | PlayerAction, PlayerAuthInput `BlockAction`s, UpdateBlock, and the action numbers (StartBreak 0, CreativeDestroyBlock 13, PredictDestroyBlock 26), confirmed by PocketMine. PlayerAuthInput now reads on to its block actions: it steps over an item interaction, gives up at an item stack request, and a tail it cannot parse only leaves the block actions unread. |
   | `types` (additions) | `Vec2`, and `uuid_bytes`: Bedrock's UUID order, two little-endian u64 halves |
 
   51 unit tests. They include a golden decode of a real client's first message, and FNV-1a
@@ -623,12 +624,30 @@ DTLS, SCTP, and multi-segment messages both ways.
     edge (about 17 chunks at radius 8).
   - Streaming happens in the session as input arrives, not in the tick loop. Chunks
     come from `FlatWorld`, so no generation cost is involved yet.
-- **World (first cut):** `world::FlatWorld` is an endless superflat overworld. It has
-  vanilla's default layers (bedrock at y = -64, two dirt, grass at -61) in plains. Every
-  chunk is identical, so the encoded payload is built once and cloned per LevelChunk. The
+- **World (mutable, implemented):** `world::World` is an endless superflat overworld with
+  vanilla's default layers (bedrock at y = -64, two dirt, grass at -61) in plains. The
   spawn is (8, -60, 8).
+  - Unchanged columns all share one generated column and its encoded payload.
+  - The first change to a column copies it into a map of changed columns behind a
+    mutex. Each changed column keeps its sub-chunk storages and a cached payload, which
+    is dropped on change and rebuilt when the chunk is next sent. So streaming, and
+    players arriving later, see the change.
+  - A column sends sub-chunks up to its highest non-air one, filling any gaps with air.
+  - `block` and `set_block` are bounded to y = -64..=319; `set_block` reports whether
+    anything changed.
+- **Block breaking (implemented):**
+  - The session accepts breaks from PlayerAuthInput block actions (StartBreak, since
+    everyone is in creative, and PredictDestroyBlock) and from a PlayerAction with
+    CreativeDestroyBlock. It checks each one first: the block must be within the world's
+    height, within 12 blocks of the eyes (creative reach is about 7.5), and in a chunk
+    the client has.
+  - `Server::break_block` sets the block to air. If that changed anything, it sends an
+    UpdateBlock (network flag, layer 0) to every player whose view contains the chunk,
+    the breaker included.
+  - Breaking is handled as input arrives, not in the tick loop. Nothing is dropped as
+    items, and there is no survival break timing or tool check yet.
 
-  Real chunk storage, generation and entities are not started yet.
+  Persistence, generation beyond superflat and entities are not started yet.
 
 ### 4.6 `mistvale_plugins`
 
@@ -722,7 +741,8 @@ Each step starts only after explicit confirmation.
 | 7 | Tick loop and visibility: 20 TPS game loop, PlayerAuthInput decoding, per-player position, rotation and head yaw, PlayerList / AddPlayer / MovePlayer / RemoveActor between players | Two live clients see each other move | ✅ done 2026-09-26; two clients (PC and Android) saw each other move after the skin geometry fix |
 | 8 | Chunk streaming: track each player's chunk, recentre on crossing a boundary, send the chunks newly in range (radius ≤ 8) with a NetworkChunkPublisherUpdate; always-visible name tags | Walking or flying far keeps loading terrain | ✅ done 2026-09-26; streaming worked live (commit `5064e11`) |
 | 9 | Entity tracker (AddPlayer and RemoveActor as players enter and leave each other's view), and own-entity metadata with HasGravity so players stop floating | A player returning to a stationary one reappears; players fall after flying | ✅ done 2026-09-26; returning players reappear and players fall after flying (commit `25e21c9`) |
-| 10 | Vanilla movement speed: the player's own UpdateAttributes (`minecraft:movement` 0.1, underwater and lava 0.02, health 20) and UpdateAbilities (creative abilities; walk 0.1, fly 0.05, vertical fly 1.0) during spawn | Walking feels like vanilla | 🧪 ready for a live test (2026-09-26) |
+| 10 | Vanilla movement speed: the player's own UpdateAttributes (`minecraft:movement` 0.1, underwater and lava 0.02, health 20) and UpdateAbilities (creative abilities; walk 0.1, fly 0.05, vertical fly 1.0) during spawn | Walking feels like vanilla | ✅ done 2026-09-26; walking feels like vanilla (commit `4bce850`) |
+| 11 | Mutable world and block breaking: `World` keeps changed columns; breaks from PlayerAuthInput block actions (StartBreak, PredictDestroyBlock) and PlayerAction (CreativeDestroyBlock), checked for height, reach and loaded chunk; UpdateBlock to every player with the chunk | Broken blocks stay broken, for everyone, and after walking away and back | 🧪 ready for a live test (2026-09-26) |
 
 Later steps are proposed but not yet scheduled:
 - player auth (JWKS verification of the multiplayer token)
@@ -757,8 +777,10 @@ Later steps are proposed but not yet scheduled:
   carries a full `geometry.humanoid.custom` definition (format 1.12.0, engine version
   `0.0.0`), the way vanilla clients send classic skins. AddPlayer and its ability layer
   were re-checked against Mojang's schema and match, and the retest succeeded. Movement is
-  still trusted as the client reports it. Sneaking and arm swings are not shown yet: they
-  depend on input flag IDs, which Mojang's schema and gophertunnel number differently.
+  still trusted as the client reports it. Sneaking and arm swings are not shown yet, but
+  the flag numbering question is settled: the bit numbers in Mojang's PlayerActionType
+  descriptions match gophertunnel's input flags (StartSneaking is bit 27, MissedSwing
+  bit 39). Mojang's enum just omits some entries.
 - **Players are not authenticated yet.** We verify that the offer's `cpk` key signed its
   DTLS fingerprints, which binds the session to that key. We do not yet verify the
   GameServerToken's RS256 signature against the Minecraft auth service JWKS, so the

@@ -1,31 +1,56 @@
-//! The world players spawn into: for now a superflat overworld.
+//! The world players spawn into: a superflat overworld whose blocks can change.
+//!
+//! Every column starts as the same generated superflat column, shared as one
+//! encoded payload. Changing a block gives that column its own storage, which
+//! is kept, and re-encoded whenever it is sent after another change.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use mistvale_protocol::block::{BlockState, StateValue};
 use mistvale_protocol::chunk::{self, PalettedStorage, SubChunk};
 use mistvale_protocol::packets::LevelChunk;
-use mistvale_protocol::types::BlockPos;
+use mistvale_protocol::types::{BlockPos, ChunkPos};
 
 /// Overworld dimension ID.
 pub const OVERWORLD: i32 = 0;
 /// Lowest block of the overworld.
 pub const MIN_Y: i32 = -64;
+/// Highest block of the overworld.
+pub const MAX_Y: i32 = 319;
 /// Sub-chunks in the overworld's y = -64..=319.
 const SUB_CHUNKS: usize = 24;
+/// Sub-chunk index of the lowest sub-chunk (y = -64 is sub-chunk -4).
+const LOWEST_SUB_CHUNK: i8 = (MIN_Y >> 4) as i8;
 /// Biome ID of plains.
 const PLAINS: u32 = 1;
 
-/// An endless superflat overworld with vanilla's default layers: bedrock, two
-/// layers of dirt and grass at y = -64..=-61, all in the plains biome.
+/// A chunk column's blocks: one storage per sub-chunk from the bottom up, or
+/// `None` for sub-chunks that are all air.
+#[derive(Debug, Clone)]
+struct Column {
+    sub_chunks: Vec<Option<PalettedStorage>>,
+    /// The encoded LevelChunk payload, until the next change.
+    payload: Option<Vec<u8>>,
+}
+
+/// An endless superflat overworld with vanilla's default layers (bedrock, two
+/// layers of dirt and grass at y = -64..=-61, all plains) that players can change.
 #[derive(Debug)]
-pub struct FlatWorld {
-    /// Every chunk is identical, so the encoded LevelChunk payload is built once.
-    payload: Vec<u8>,
+pub struct World {
+    air: u32,
+    /// The generated column, which every unchanged chunk shares.
+    generated: Column,
+    generated_payload: Vec<u8>,
+    /// Columns with changes, by chunk position.
+    changed: Mutex<HashMap<ChunkPos, Column>>,
     /// Height of the top (grass) layer.
     surface_y: i32,
 }
 
-impl FlatWorld {
+impl World {
     pub fn new() -> Self {
+        let air = BlockState::new("minecraft:air").network_id();
         let dirt = BlockState::new("minecraft:dirt");
         let layers = [
             BlockState::new("minecraft:bedrock").with("infiniburn_bit", StateValue::Byte(0)),
@@ -34,7 +59,7 @@ impl FlatWorld {
             BlockState::new("minecraft:grass_block"),
         ];
 
-        let mut blocks = PalettedStorage::filled(BlockState::new("minecraft:air").network_id());
+        let mut blocks = PalettedStorage::filled(air);
         for (y, block) in (0u8..).zip(&layers) {
             let network_id = block.network_id();
             for x in 0..16 {
@@ -43,15 +68,18 @@ impl FlatWorld {
                 }
             }
         }
-        let sub_chunk = SubChunk {
-            layers: vec![blocks],
+        let mut generated = Column {
+            sub_chunks: vec![None; SUB_CHUNKS],
+            payload: None,
         };
-        let biomes = vec![PalettedStorage::filled(PLAINS); SUB_CHUNKS];
-        let lowest_sub_chunk =
-            i8::try_from(MIN_Y >> 4).expect("the overworld floor is sub-chunk -4");
+        generated.sub_chunks[0] = Some(blocks);
+        let generated_payload = generated.encode(air);
 
         Self {
-            payload: chunk::level_chunk_payload(lowest_sub_chunk, &[sub_chunk], &biomes),
+            air,
+            generated,
+            generated_payload,
+            changed: Mutex::new(HashMap::new()),
             surface_y: MIN_Y + layers.len() as i32 - 1,
         }
     }
@@ -65,23 +93,125 @@ impl FlatWorld {
         }
     }
 
-    /// The chunk column at chunk coordinates (`x`, `z`).
+    /// The network ID of air.
+    pub fn air(&self) -> u32 {
+        self.air
+    }
+
+    /// The network ID of the block at `pos`; air outside the world's height.
+    pub fn block(&self, pos: BlockPos) -> u32 {
+        let Some((sub_chunk, x, y, z)) = locate(pos) else {
+            return self.air;
+        };
+        let changed = self.changed();
+        let column = changed
+            .get(&ChunkPos::of_block(pos))
+            .unwrap_or(&self.generated);
+        column.sub_chunks[sub_chunk]
+            .as_ref()
+            .map_or(self.air, |storage| storage.get(x, y, z))
+    }
+
+    /// Sets the block at `pos` to the block with network ID `block`. Returns
+    /// whether anything changed; positions outside the world's height never do.
+    pub fn set_block(&self, pos: BlockPos, block: u32) -> bool {
+        let Some((sub_chunk, x, y, z)) = locate(pos) else {
+            return false;
+        };
+        let mut changed = self.changed();
+        let column = changed
+            .entry(ChunkPos::of_block(pos))
+            .or_insert_with(|| self.generated.clone());
+        let storage =
+            column.sub_chunks[sub_chunk].get_or_insert_with(|| PalettedStorage::filled(self.air));
+        if storage.get(x, y, z) == block {
+            return false;
+        }
+        storage.set(x, y, z, block);
+        column.payload = None;
+        true
+    }
+
+    /// The chunk column at chunk coordinates (`x`, `z`), with any changes.
     pub fn chunk(&self, x: i32, z: i32) -> LevelChunk {
+        let mut changed = self.changed();
+        let (sub_chunk_count, payload) = match changed.get_mut(&ChunkPos::new(x, z)) {
+            Some(column) => {
+                if column.payload.is_none() {
+                    column.payload = Some(column.encode(self.air));
+                }
+                let payload = column.payload.clone().expect("just encoded");
+                (column.sent_sub_chunks(), payload)
+            }
+            None => (
+                self.generated.sent_sub_chunks(),
+                self.generated_payload.clone(),
+            ),
+        };
         LevelChunk {
             x,
             z,
             dimension: OVERWORLD,
-            // Only the bottom sub-chunk holds blocks; everything above is air.
-            sub_chunk_count: 1,
-            payload: self.payload.clone(),
+            sub_chunk_count,
+            payload,
         }
+    }
+
+    fn changed(&self) -> MutexGuard<'_, HashMap<ChunkPos, Column>> {
+        // Columns stay consistent even if a holder panicked.
+        self.changed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
-impl Default for FlatWorld {
+impl Default for World {
     fn default() -> Self {
         Self::new()
     }
+}
+
+impl Column {
+    /// Sub-chunks sent: up to the highest one holding anything but air.
+    fn sent_sub_chunks(&self) -> u32 {
+        let highest = self
+            .sub_chunks
+            .iter()
+            .rposition(Option::is_some)
+            .map_or(0, |index| index + 1);
+        u32::try_from(highest).expect("24 sub-chunks")
+    }
+
+    /// The LevelChunk payload: sub-chunks from the bottom up to the highest
+    /// non-air one (air in between), then plains biomes for the full height.
+    fn encode(&self, air: u32) -> Vec<u8> {
+        let count = self.sent_sub_chunks() as usize;
+        let sub_chunks: Vec<SubChunk> = self.sub_chunks[..count]
+            .iter()
+            .map(|storage| SubChunk {
+                layers: vec![
+                    storage
+                        .clone()
+                        .unwrap_or_else(|| PalettedStorage::filled(air)),
+                ],
+            })
+            .collect();
+        let biomes = vec![PalettedStorage::filled(PLAINS); SUB_CHUNKS];
+        chunk::level_chunk_payload(LOWEST_SUB_CHUNK, &sub_chunks, &biomes)
+    }
+}
+
+/// The sub-chunk index (from the bottom) and position within it of `pos`, if
+/// `pos` is within the world's height.
+fn locate(pos: BlockPos) -> Option<(usize, u8, u8, u8)> {
+    if !(MIN_Y..=MAX_Y).contains(&pos.y) {
+        return None;
+    }
+    let sub_chunk = usize::try_from((pos.y - MIN_Y) >> 4).ok()?;
+    Some((
+        sub_chunk,
+        (pos.x & 15) as u8,
+        (pos.y & 15) as u8,
+        (pos.z & 15) as u8,
+    ))
 }
 
 #[cfg(test)]
@@ -92,12 +222,12 @@ mod tests {
 
     #[test]
     fn players_stand_on_the_grass() {
-        assert_eq!(FlatWorld::new().spawn(), BlockPos { x: 8, y: -60, z: 8 });
+        assert_eq!(World::new().spawn(), BlockPos { x: 8, y: -60, z: 8 });
     }
 
     #[test]
     fn chunks_hold_one_sub_chunk_and_a_biome_per_sub_chunk() {
-        let world = FlatWorld::new();
+        let world = World::new();
         let chunk = world.chunk(3, -2);
         assert_eq!((chunk.x, chunk.z, chunk.sub_chunk_count), (3, -2, 1));
 
@@ -112,5 +242,41 @@ mod tests {
             "four palette entries, zigzag encoded"
         );
         assert!(payload.ends_with(&[&[0x01, 0x02][..], &[0xFF; 23], &[0]].concat()));
+    }
+
+    #[test]
+    fn breaking_a_block_changes_only_its_chunk() {
+        let world = World::new();
+        let grass = BlockState::new("minecraft:grass_block").network_id();
+        let pos = BlockPos {
+            x: -3,
+            y: -61,
+            z: 20,
+        };
+        assert_eq!(world.block(pos), grass);
+        let untouched = world.chunk(-1, 1).payload;
+
+        assert!(world.set_block(pos, world.air()));
+        assert!(!world.set_block(pos, world.air()), "already air");
+        assert_eq!(world.block(pos), world.air());
+        // Chunk (-1, 1) holds (-3, 20); its neighbours are still generated.
+        assert_ne!(world.chunk(-1, 1).payload, untouched);
+        assert_eq!(world.chunk(0, 1).payload, untouched);
+        assert_eq!(world.block(BlockPos { x: -2, ..pos }), grass);
+    }
+
+    #[test]
+    fn building_high_sends_more_sub_chunks_and_the_height_is_bounded() {
+        let world = World::new();
+        let stone = BlockState::new("minecraft:stone").network_id();
+        assert!(world.set_block(BlockPos { x: 0, y: 40, z: 0 }, stone));
+        // y = 40 is in sub-chunk 2 (32..48), the 7th from the bottom.
+        let chunk = world.chunk(0, 0);
+        assert_eq!(chunk.sub_chunk_count, 7);
+        assert_eq!(world.block(BlockPos { x: 0, y: 40, z: 0 }), stone);
+
+        assert!(!world.set_block(BlockPos { x: 0, y: 320, z: 0 }, stone));
+        assert!(!world.set_block(BlockPos { x: 0, y: -65, z: 0 }, stone));
+        assert_eq!(world.block(BlockPos { x: 0, y: 400, z: 0 }), world.air());
     }
 }
