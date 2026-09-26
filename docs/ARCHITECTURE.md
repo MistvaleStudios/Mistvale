@@ -646,6 +646,34 @@ DTLS, SCTP, and multi-segment messages both ways.
     the breaker included.
   - Breaking is handled as input arrives, not in the tick loop. Nothing is dropped as
     items, and there is no survival break timing or tool check yet.
+  - Breaking also sends a LevelEvent 2001 (`DESTROY_BLOCK`, with the broken block's
+    network ID) to the chunk's viewers: the breaking particles and sound.
+- **Inventory (first cut):** `inventory` gives every player a fixed creative hotbar of
+  nine vanilla blocks without block states: stone, grass, dirt, cobblestone, oak planks,
+  sand, glass, white wool and bookshelf.
+  - The ItemRegistry sent with StartGame lists only these items, with vanilla's item
+    network IDs and entry version 2, as in PocketMine's `required_item_list.json`.
+  - An InventoryContent for window 0 goes out at spawn. Each stack has a unique stack
+    network ID, and each block item carries its block's hashed network ID.
+  - Stacks never run out, and inventory moves (item stack requests) are not handled.
+- **Block placing (implemented):** placing arrives in InventoryTransaction as a UseItem
+  transaction with action ClickBlock; only that part is decoded.
+  - The decode fails soft: an unreadable transaction is ignored.
+  - The block goes against the clicked face, and must come from a hotbar slot whose item
+    matches the held one. The target must be reachable, in a loaded chunk, air, and not
+    inside the placing player's own box. Other players' boxes are not checked yet.
+  - `Server::place_block` places only into air, checked under the world lock, then sends
+    viewers an UpdateBlock and a LevelSoundEvent `place` (sounds are named by string in
+    2193).
+  - The client places a block before hearing back, so a refused placement is undone: the
+    placer gets an UpdateBlock with what is really there.
+- **Swings and sneaking (implemented):** these come from input flags.
+  - MissedSwing (bit 39), a break or a placement sends an Animate arm swing to everyone
+    who sees the player.
+  - StartSneaking and StopSneaking (bits 27 and 28) toggle the Sneaking entity flag and
+    a 1.5-block height. The resulting SetActorData goes to viewers and to the player
+    themselves, which Mojang's docs say the client expects.
+  - AddPlayer carries the current sneaking state.
 
   Persistence, generation beyond superflat and entities are not started yet.
 
@@ -742,7 +770,8 @@ Each step starts only after explicit confirmation.
 | 8 | Chunk streaming: track each player's chunk, recentre on crossing a boundary, send the chunks newly in range (radius ≤ 8) with a NetworkChunkPublisherUpdate; always-visible name tags | Walking or flying far keeps loading terrain | ✅ done 2026-09-26; streaming worked live (commit `5064e11`) |
 | 9 | Entity tracker (AddPlayer and RemoveActor as players enter and leave each other's view), and own-entity metadata with HasGravity so players stop floating | A player returning to a stationary one reappears; players fall after flying | ✅ done 2026-09-26; returning players reappear and players fall after flying (commit `25e21c9`) |
 | 10 | Vanilla movement speed: the player's own UpdateAttributes (`minecraft:movement` 0.1, underwater and lava 0.02, health 20) and UpdateAbilities (creative abilities; walk 0.1, fly 0.05, vertical fly 1.0) during spawn | Walking feels like vanilla | ✅ done 2026-09-26; walking feels like vanilla (commit `4bce850`) |
-| 11 | Mutable world and block breaking: `World` keeps changed columns; breaks from PlayerAuthInput block actions (StartBreak, PredictDestroyBlock) and PlayerAction (CreativeDestroyBlock), checked for height, reach and loaded chunk; UpdateBlock to every player with the chunk | Broken blocks stay broken, for everyone, and after walking away and back | 🧪 ready for a live test (2026-09-26) |
+| 11 | Mutable world and block breaking: `World` keeps changed columns; breaks from PlayerAuthInput block actions (StartBreak, PredictDestroyBlock) and PlayerAction (CreativeDestroyBlock), checked for height, reach and loaded chunk; UpdateBlock to every player with the chunk | Broken blocks stay broken, for everyone, and after walking away and back | ✅ done 2026-09-26; breaks persist and sync across clients (commit `e9ebff0`) |
+| 12 | Block placing and feedback: a hotbar of 9 vanilla blocks (a partial ItemRegistry with vanilla item IDs, InventoryContent at spawn), ClickBlock from InventoryTransaction placed against the clicked face (reach, air, not inside the placer; refusals undone with UpdateBlock), UpdateBlock plus the `place` sound; break particles (LevelEvent 2001); arm swings (Animate); sneaking (SetActorData) | Blocks can be placed and everyone sees and hears building; swings and crouching show | 🧪 ready for a live test (2026-09-26) |
 
 Later steps are proposed but not yet scheduled:
 - player auth (JWKS verification of the multiplayer token)
@@ -777,10 +806,15 @@ Later steps are proposed but not yet scheduled:
   carries a full `geometry.humanoid.custom` definition (format 1.12.0, engine version
   `0.0.0`), the way vanilla clients send classic skins. AddPlayer and its ability layer
   were re-checked against Mojang's schema and match, and the retest succeeded. Movement is
-  still trusted as the client reports it. Sneaking and arm swings are not shown yet, but
+  still trusted as the client reports it. Sneaking and arm swings are now shown, because
   the flag numbering question is settled: the bit numbers in Mojang's PlayerActionType
   descriptions match gophertunnel's input flags (StartSneaking is bit 27, MissedSwing
   bit 39). Mojang's enum just omits some entries.
+- **A partial ItemRegistry is untested with a live client.** Only nine items are
+  registered, with vanilla's IDs, where vanilla sends about 1,900. An empty registry
+  worked for spawning, but held items might not render or be usable. The hotbar blocks
+  are also assumed to have no block states in 26.51. If one shows as an unknown block,
+  its state hash is wrong.
 - **Players are not authenticated yet.** We verify that the offer's `cpk` key signed its
   DTLS fingerprints, which binds the session to that key. We do not yet verify the
   GameServerToken's RS256 signature against the Minecraft auth service JWKS, so the

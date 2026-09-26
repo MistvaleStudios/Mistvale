@@ -115,21 +115,41 @@ impl World {
     /// Sets the block at `pos` to the block with network ID `block`. Returns
     /// whether anything changed; positions outside the world's height never do.
     pub fn set_block(&self, pos: BlockPos, block: u32) -> bool {
-        let Some((sub_chunk, x, y, z)) = locate(pos) else {
-            return false;
-        };
+        self.update_block(pos, |_| Some(block)).is_some()
+    }
+
+    /// Sets the block at `pos` to `block`, returning the block it replaced if
+    /// anything changed.
+    pub fn replace_block(&self, pos: BlockPos, block: u32) -> Option<u32> {
+        self.update_block(pos, |_| Some(block))
+    }
+
+    /// Puts `block` at `pos` if it is air there now. Returns whether it did.
+    pub fn place_block(&self, pos: BlockPos, block: u32) -> bool {
+        let air = self.air;
+        self.update_block(pos, |current| (current == air).then_some(block))
+            .is_some()
+    }
+
+    /// Changes the block at `pos` to what `change` makes of the current one,
+    /// under one lock. Returns the previous block if anything changed.
+    fn update_block(&self, pos: BlockPos, change: impl FnOnce(u32) -> Option<u32>) -> Option<u32> {
+        let (sub_chunk, x, y, z) = locate(pos)?;
         let mut changed = self.changed();
+        let chunk = ChunkPos::of_block(pos);
+        let current = changed.get(&chunk).unwrap_or(&self.generated).sub_chunks[sub_chunk]
+            .as_ref()
+            .map_or(self.air, |storage| storage.get(x, y, z));
+        let block = change(current).filter(|block| *block != current)?;
+
         let column = changed
-            .entry(ChunkPos::of_block(pos))
+            .entry(chunk)
             .or_insert_with(|| self.generated.clone());
-        let storage =
-            column.sub_chunks[sub_chunk].get_or_insert_with(|| PalettedStorage::filled(self.air));
-        if storage.get(x, y, z) == block {
-            return false;
-        }
-        storage.set(x, y, z, block);
+        column.sub_chunks[sub_chunk]
+            .get_or_insert_with(|| PalettedStorage::filled(self.air))
+            .set(x, y, z, block);
         column.payload = None;
-        true
+        Some(current)
     }
 
     /// The chunk column at chunk coordinates (`x`, `z`), with any changes.
@@ -263,6 +283,21 @@ mod tests {
         assert_ne!(world.chunk(-1, 1).payload, untouched);
         assert_eq!(world.chunk(0, 1).payload, untouched);
         assert_eq!(world.block(BlockPos { x: -2, ..pos }), grass);
+    }
+
+    #[test]
+    fn replacing_reports_the_old_block_and_placing_needs_air() {
+        let world = World::new();
+        let grass = BlockState::new("minecraft:grass_block").network_id();
+        let stone = BlockState::new("minecraft:stone").network_id();
+        let ground = BlockPos { x: 1, y: -61, z: 1 };
+        let above = BlockPos { y: -60, ..ground };
+
+        assert!(!world.place_block(ground, stone), "grass is in the way");
+        assert!(world.place_block(above, stone));
+        assert!(!world.place_block(above, stone), "now stone is");
+        assert_eq!(world.replace_block(ground, world.air()), Some(grass));
+        assert_eq!(world.replace_block(ground, world.air()), None);
     }
 
     #[test]

@@ -30,22 +30,24 @@ use mistvale_protocol::nbt::Compound;
 use mistvale_protocol::packet::{self, Encode as _, id};
 use mistvale_protocol::packets::{
     AbilityData, AbilityLayer, Attribute, ChunkRadiusUpdated, CreativeContent, Disconnect,
-    DisconnectMessage, DisconnectReason, EXEMPTED_PACKS, GameRule, GameRuleValue, ItemRegistry,
-    JigsawStructureData, Login, NetworkChunkPublisherUpdate, NetworkSettings, PackResponse,
-    PlayStatus, PlayStatusCode, PlayerAction, PlayerAuthInput, PlayerMovementSettings,
-    RequestChunkRadius, RequestNetworkSettings, ResourcePackClientResponse, ResourcePackStack,
-    ResourcePacksInfo, SetActorData, SetLocalPlayerAsInitialized, StackPack, StartGame, Text,
-    TextType, UpdateAbilities, UpdateAttributes, VoxelShapes, ability, player_action,
+    DisconnectMessage, DisconnectReason, EXEMPTED_PACKS, GameRule, GameRuleValue,
+    InventoryTransaction, JigsawStructureData, Login, NetworkChunkPublisherUpdate, NetworkSettings,
+    PackResponse, PlayStatus, PlayStatusCode, PlayerAction, PlayerAuthInput,
+    PlayerMovementSettings, RequestChunkRadius, RequestNetworkSettings, ResourcePackClientResponse,
+    ResourcePackStack, ResourcePacksInfo, SetActorData, SetLocalPlayerAsInitialized, StackPack,
+    StartGame, Text, TextType, UpdateAbilities, UpdateAttributes, VoxelShapes, ability, input_flag,
+    player_action, use_item_action,
 };
 use mistvale_protocol::types::{BlockPos, ChunkPos, Vec3};
 use mistvale_protocol::{GAME_VERSION, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::inventory;
 use crate::players::{
     EYE_HEIGHT, Joining, Movement, OUTBOUND_QUEUE, Profile, View, player_metadata,
 };
-use crate::server::Server;
+use crate::server::{self, Server};
 use crate::view::ChunkView;
 use crate::world::{MAX_Y, MIN_Y, OVERWORLD, World};
 
@@ -140,6 +142,23 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
                             SessionEvent::BrokeBlock(pos) => {
                                 server.break_block(pos);
                             }
+                            SessionEvent::PlacedBlock { pos, block } => {
+                                // Someone may have filled the spot since it
+                                // was checked; undo the client's prediction.
+                                if !server.place_block(pos, block) {
+                                    let _ = outbound.try_send(server::block_update(pos, server.world.block(pos)));
+                                }
+                            }
+                            SessionEvent::Swing => {
+                                if let Some(membership) = &membership {
+                                    membership.swing();
+                                }
+                            }
+                            SessionEvent::Sneaking(sneaking) => {
+                                if let Some(membership) = &membership {
+                                    membership.sneaking(sneaking);
+                                }
+                            }
                             SessionEvent::Chat(message) => {
                                 server.players.chat(session.player(), &message);
                             }
@@ -223,6 +242,12 @@ pub enum SessionEvent {
     Viewing(View),
     /// The player broke the block at this position.
     BrokeBlock(BlockPos),
+    /// The player placed `block` (a network ID) at `pos`, which was air.
+    PlacedBlock { pos: BlockPos, block: u32 },
+    /// The player swung their arm.
+    Swing,
+    /// The player started or stopped sneaking.
+    Sneaking(bool),
     /// The player said something in chat.
     Chat(String),
 }
@@ -372,6 +397,15 @@ impl Session {
             (Stage::InGame, id::TEXT) => Ok(self.text(packet::decode(payload)?)),
             (Stage::InGame, id::PLAYER_AUTH_INPUT) => Ok(self.auth_input(packet::decode(payload)?)),
             (Stage::InGame, id::PLAYER_ACTION) => Ok(self.player_action(packet::decode(payload)?)),
+            // Only item use is decoded; a transaction that cannot be read is
+            // ignored rather than ending the session.
+            (Stage::InGame, id::INVENTORY_TRANSACTION) => match packet::decode(payload) {
+                Ok(transaction) => Ok(self.inventory_transaction(transaction)),
+                Err(err) => {
+                    tracing::debug!(player = %self.player, %err, "ignoring an unreadable inventory transaction");
+                    Ok(Reply::default())
+                }
+            },
             (stage, id) if stage.in_world() => {
                 // Movement input starts before the player is initialized.
                 if id != id::PLAYER_AUTH_INPUT {
@@ -496,8 +530,8 @@ impl Session {
                     JigsawStructureData::empty().encode(),
                     VoxelShapes.encode(),
                     start_game(&self.world, self.entity_id, &self.movement).encode(),
-                    // No items yet; the client spawns with an empty inventory.
-                    ItemRegistry::default().encode(),
+                    // Only the items players are given.
+                    inventory::item_registry().encode(),
                 ]))
             }
             PackResponse::Downloading(_) => Ok(Reply::disconnect(
@@ -523,7 +557,7 @@ impl Session {
             packets.push(
                 SetActorData {
                     entity_runtime_id: self.entity_id,
-                    metadata: player_metadata(&self.player),
+                    metadata: player_metadata(&self.player, false),
                     tick: 0,
                 }
                 .encode(),
@@ -532,6 +566,8 @@ impl Session {
             // attribute and the walk and fly speeds of its ability layer.
             packets.push(self.own_attributes().encode());
             packets.push(self.own_abilities().encode());
+            // A hotbar of blocks to build with.
+            packets.push(inventory::starting_inventory().encode());
             packets.push(
                 PlayStatus {
                     status: PlayStatusCode::PlayerSpawn,
@@ -661,7 +697,7 @@ impl Session {
         if input.block_actions_unread {
             tracing::debug!(player = %self.player, "block actions hidden behind an item stack request");
         }
-        let broken: Vec<SessionEvent> = input
+        let mut events: Vec<SessionEvent> = input
             .block_actions
             .iter()
             .filter(|action| {
@@ -674,9 +710,67 @@ impl Session {
             })
             .filter_map(|action| self.break_block(action.position))
             .collect();
+
+        // What others see: the arm swinging at air or at a block, and sneaking.
+        let flags = &input.input_flags;
+        if flags.contains(&input_flag::MISSED_SWING) || !events.is_empty() {
+            events.push(SessionEvent::Swing);
+        }
+        if flags.contains(&input_flag::START_SNEAKING) {
+            events.push(SessionEvent::Sneaking(true));
+        } else if flags.contains(&input_flag::STOP_SNEAKING) {
+            events.push(SessionEvent::Sneaking(false));
+        }
+
         let mut reply = self.movement_input(input);
-        reply.events.extend(broken);
+        reply.events.extend(events);
         reply
+    }
+
+    /// Right-clicking a block with a hotbar block places it against the
+    /// clicked face. The client predicts the placement, so a refused one is
+    /// undone with the block that is really there.
+    fn inventory_transaction(&mut self, transaction: InventoryTransaction) -> Reply {
+        let InventoryTransaction::UseItem(use_item) = transaction else {
+            return Reply::default();
+        };
+        if use_item.action != use_item_action::CLICK_BLOCK || use_item.held_item.is_empty() {
+            return Reply::default();
+        }
+        let target = use_item.target();
+        let block = inventory::hotbar_block(use_item.hotbar_slot)
+            .filter(|block| *block == use_item.held_item.block_runtime_id);
+        match block {
+            Some(block) if self.may_place(target) => Reply {
+                events: vec![
+                    SessionEvent::PlacedBlock { pos: target, block },
+                    SessionEvent::Swing,
+                ],
+                ..Reply::default()
+            },
+            _ => {
+                tracing::debug!(player = %self.player, ?target, slot = use_item.hotbar_slot, "refusing a placement");
+                Reply::send(vec![
+                    server::block_update(target, self.world.block(target)).to_vec(),
+                ])
+            }
+        }
+    }
+
+    /// Whether a block may go at `pos`: reachable, in a loaded chunk, into
+    /// air, and not inside the player placing it.
+    fn may_place(&self, pos: BlockPos) -> bool {
+        if self.break_block(pos).is_none() || self.world.block(pos) != self.world.air() {
+            return false;
+        }
+        // The player's box: 0.6 wide, 1.8 tall, from their feet.
+        let feet = self.movement.feet();
+        let overlaps =
+            |low: f32, high: f32, block: i32| low < (block + 1) as f32 && high > block as f32;
+        let inside_player = overlaps(feet.x - 0.3, feet.x + 0.3, pos.x)
+            && overlaps(feet.y, feet.y + 1.8, pos.y)
+            && overlaps(feet.z - 0.3, feet.z + 0.3, pos.z);
+        !inside_player
     }
 
     /// A PlayerAction: creative clients report instant breaks this way too.
@@ -887,7 +981,7 @@ mod tests {
     use mistvale_net::identity::verify_client;
     use mistvale_net::sdp::SdpFingerprint;
     use mistvale_protocol::packet::Decode;
-    use mistvale_protocol::packets::BlockAction;
+    use mistvale_protocol::packets::{BlockAction, UseItem};
 
     use super::*;
 
@@ -1036,16 +1130,17 @@ mod tests {
         // The player's own entity data (gravity), attributes and abilities
         // (speeds) come just before PlayerSpawn.
         assert_eq!(
-            sent[sent.len() - 5..],
+            sent[sent.len() - 6..],
             [
                 id::SET_ACTOR_DATA,
                 id::UPDATE_ATTRIBUTES,
                 id::UPDATE_ABILITIES,
+                id::INVENTORY_CONTENT,
                 id::PLAY_STATUS,
                 id::CREATIVE_CONTENT
             ]
         );
-        let attributes = &reply.packets[sent.len() - 4];
+        let attributes = &reply.packets[sent.len() - 5];
         let movement = b"minecraft:movement";
         let at = attributes
             .windows(movement.len())
@@ -1258,6 +1353,128 @@ mod tests {
         };
         session.handle(&initialized.encode()).unwrap();
         session
+    }
+
+    fn place(slot: i32, block_position: BlockPos, face: u8) -> Vec<u8> {
+        let held_item = inventory::starting_inventory().content[slot.clamp(0, 35) as usize];
+        InventoryTransaction::UseItem(UseItem {
+            action: use_item_action::CLICK_BLOCK,
+            trigger: 1,
+            block_position,
+            face,
+            hotbar_slot: slot,
+            held_item,
+            player_position: Vec3::default(),
+            clicked_position: Vec3::default(),
+            block_runtime_id: 0,
+            client_prediction: 1,
+        })
+        .encode()
+    }
+
+    #[test]
+    fn places_hotbar_blocks_against_the_clicked_face() {
+        let mut session = in_game_session();
+        // Click the top (face 1) of the grass two blocks east of the player.
+        let grass = BlockPos {
+            x: 10,
+            y: -61,
+            z: 8,
+        };
+        let reply = session.handle(&place(0, grass, 1)).unwrap();
+        let stone = inventory::hotbar_block(0).unwrap();
+        assert_eq!(
+            reply.events,
+            [
+                SessionEvent::PlacedBlock {
+                    pos: BlockPos {
+                        x: 10,
+                        y: -60,
+                        z: 8
+                    },
+                    block: stone
+                },
+                SessionEvent::Swing
+            ]
+        );
+        assert!(reply.packets.is_empty());
+    }
+
+    #[test]
+    fn refused_placements_are_undone_on_the_client() {
+        let mut session = in_game_session();
+        // The player stands on (8, -61, 8): placing on top of it would be
+        // inside them. The client already shows the block, so it gets air back.
+        for refused in [
+            place(0, BlockPos { x: 8, y: -61, z: 8 }, 1),
+            // Clicking the side of grass targets grass: not air.
+            place(
+                0,
+                BlockPos {
+                    x: 10,
+                    y: -61,
+                    z: 8,
+                },
+                5,
+            ),
+            // Out of reach, and an empty slot.
+            place(
+                0,
+                BlockPos {
+                    x: 40,
+                    y: -61,
+                    z: 8,
+                },
+                1,
+            ),
+            place(
+                20,
+                BlockPos {
+                    x: 10,
+                    y: -61,
+                    z: 8,
+                },
+                1,
+            ),
+        ] {
+            let reply = session.handle(&refused).unwrap();
+            assert!(reply.events.is_empty(), "{:?}", reply.events);
+        }
+        let reply = session
+            .handle(&place(0, BlockPos { x: 8, y: -61, z: 8 }, 1))
+            .unwrap();
+        assert_eq!(ids(&reply), [id::UPDATE_BLOCK]);
+    }
+
+    #[test]
+    fn swings_and_sneaking_come_from_input_flags() {
+        let mut session = in_game_session();
+        let here = Vec3 {
+            x: 8.5,
+            y: -60.0 + EYE_HEIGHT,
+            z: 8.5,
+        };
+        let with_flags = |flags: Vec<i32>| {
+            let mut input =
+                PlayerAuthInput::decode_payload(&mut mistvale_protocol::io::Reader::new(
+                    &breaking_input(here, 0.0, Vec::new())[2..],
+                ))
+                .unwrap();
+            input.input_flags = flags;
+            input.encode()
+        };
+        let reply = session
+            .handle(&with_flags(vec![input_flag::MISSED_SWING]))
+            .unwrap();
+        assert_eq!(reply.events, [SessionEvent::Swing]);
+        let reply = session
+            .handle(&with_flags(vec![input_flag::START_SNEAKING]))
+            .unwrap();
+        assert_eq!(reply.events, [SessionEvent::Sneaking(true)]);
+        let reply = session
+            .handle(&with_flags(vec![input_flag::STOP_SNEAKING]))
+            .unwrap();
+        assert_eq!(reply.events, [SessionEvent::Sneaking(false)]);
     }
 
     #[test]

@@ -12,8 +12,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use bytes::Bytes;
 use mistvale_protocol::packet::Encode;
 use mistvale_protocol::packets::{
-    AddPlayer, EntityMetadata, MetadataValue, MoveMode, MovePlayer, PlayerList, PlayerListEntry,
-    RemoveActor, Skin, Text, entity_flag, metadata_key,
+    AddPlayer, Animate, EntityMetadata, MetadataValue, MoveMode, MovePlayer, PlayerList,
+    PlayerListEntry, RemoveActor, SetActorData, Skin, Text, entity_flag, metadata_key,
 };
 use mistvale_protocol::types::{BlockPos, ChunkPos, Vec3};
 use tokio::sync::mpsc::{self, error::TrySendError};
@@ -92,6 +92,7 @@ struct Online {
     /// Whether `movement` changed since the last tick.
     moved: bool,
     view: View,
+    sneaking: bool,
     /// Players whose entity this player's client has, by entity ID.
     seen: HashSet<u64>,
     outbound: Outbound,
@@ -138,6 +139,7 @@ impl Players {
             movement,
             moved: false,
             view,
+            sneaking: false,
             seen: HashSet::new(),
             outbound,
         };
@@ -199,7 +201,7 @@ impl Players {
         }
         for (viewer_id, target_id) in spawns {
             let target = &online[&target_id];
-            let packet = encode(&add_player(target_id, &target.profile, &target.movement));
+            let packet = encode(&add_player(target_id, target));
             online[&viewer_id].send(packet);
         }
 
@@ -295,6 +297,43 @@ impl Membership<'_> {
             player.view = view;
         }
     }
+
+    /// Starts or stops the player sneaking: their entity data goes to everyone
+    /// who sees them, and to themselves, since the client waits for it.
+    pub fn sneaking(&self, sneaking: bool) {
+        let mut online = self.players.online();
+        let Some(player) = online.get_mut(&self.entity_id) else {
+            return;
+        };
+        if player.sneaking == sneaking {
+            return;
+        }
+        player.sneaking = sneaking;
+        let packet = encode(&SetActorData {
+            entity_runtime_id: self.entity_id,
+            metadata: player_metadata(&player.profile.name, sneaking),
+            tick: 0,
+        });
+        for (id, other) in online.iter() {
+            if *id == self.entity_id || other.seen.contains(&self.entity_id) {
+                other.send(packet.clone());
+            }
+        }
+    }
+
+    /// Shows the player swinging their arm to everyone who sees them; their
+    /// own client animates itself.
+    pub fn swing(&self) {
+        let packet = encode(&Animate {
+            action: Animate::SWING_ARM,
+            entity_runtime_id: self.entity_id,
+        });
+        for other in self.players.online().values() {
+            if other.seen.contains(&self.entity_id) {
+                other.send(packet.clone());
+            }
+        }
+    }
 }
 
 impl Drop for Membership<'_> {
@@ -317,26 +356,41 @@ impl Drop for Membership<'_> {
 }
 
 /// Metadata for a player's entity, for their own client and for others: their
-/// name, always shown, a player-sized box, and the flags that make the client
-/// apply gravity and collisions.
-pub fn player_metadata(name: &str) -> EntityMetadata {
-    let flags = entity_flag::bits(&[
+/// name, always shown, a player-sized box (lower while sneaking), and the
+/// flags that make the client apply gravity and collisions.
+pub fn player_metadata(name: &str, sneaking: bool) -> EntityMetadata {
+    let mut flags = vec![
         entity_flag::HAS_GRAVITY,
         entity_flag::HAS_COLLISION,
         entity_flag::BREATHING,
         entity_flag::CAN_CLIMB,
         entity_flag::SHOW_NAME,
         entity_flag::ALWAYS_SHOW_NAME,
-    ]);
+    ];
+    if sneaking {
+        flags.push(entity_flag::SNEAKING);
+    }
+    let height = if sneaking {
+        SNEAKING_HEIGHT
+    } else {
+        STANDING_HEIGHT
+    };
     EntityMetadata(vec![
-        (metadata_key::FLAGS, MetadataValue::Long(flags)),
+        (
+            metadata_key::FLAGS,
+            MetadataValue::Long(entity_flag::bits(&flags)),
+        ),
         (metadata_key::NAME, MetadataValue::String(name.to_owned())),
         (metadata_key::SCALE, MetadataValue::Float(1.0)),
         (metadata_key::WIDTH, MetadataValue::Float(0.6)),
-        (metadata_key::HEIGHT, MetadataValue::Float(1.8)),
+        (metadata_key::HEIGHT, MetadataValue::Float(height)),
         (metadata_key::ALWAYS_SHOW_NAME_TAG, MetadataValue::Byte(1)),
     ])
 }
+
+/// A player's height standing and sneaking, in blocks.
+const STANDING_HEIGHT: f32 = 1.8;
+const SNEAKING_HEIGHT: f32 = 1.5;
 
 fn encode(packet: &impl Encode) -> Bytes {
     Bytes::from(packet.encode())
@@ -361,17 +415,18 @@ fn list_entry(entity_id: u64, profile: &Profile) -> PlayerListEntry {
     }
 }
 
-fn add_player(entity_id: u64, profile: &Profile, movement: &Movement) -> AddPlayer {
+fn add_player(entity_id: u64, player: &Online) -> AddPlayer {
+    let movement = &player.movement;
     AddPlayer {
-        uuid: profile.uuid,
-        username: profile.name.clone(),
+        uuid: player.profile.uuid,
+        username: player.profile.name.clone(),
         entity_runtime_id: entity_id,
         position: movement.feet(),
         pitch: movement.pitch,
         yaw: movement.yaw,
         head_yaw: movement.head_yaw,
         game_mode: 1,
-        metadata: player_metadata(&profile.name),
+        metadata: player_metadata(&player.profile.name, player.sneaking),
         entity_unique_id: unique_id(entity_id),
     }
 }
@@ -505,8 +560,32 @@ mod tests {
     }
 
     #[test]
+    fn sneaking_and_swings_reach_those_who_see_the_player() {
+        let players = Players::new();
+        let (steve, mut steve_queue) = joining(&players, "Steve");
+        let (alex, mut alex_queue) = joining(&players, "Alex");
+        let steve = players.join(steve);
+        let _alex = players.join(alex);
+        players.tick(1);
+        ids(&mut steve_queue);
+        ids(&mut alex_queue);
+
+        // Sneaking: everyone who sees Steve, and Steve himself, get his data.
+        steve.sneaking(true);
+        assert_eq!(ids(&mut alex_queue), [id::SET_ACTOR_DATA]);
+        assert_eq!(ids(&mut steve_queue), [id::SET_ACTOR_DATA]);
+        steve.sneaking(true);
+        assert!(ids(&mut alex_queue).is_empty(), "no change, nothing sent");
+
+        // Swinging: only the others; Steve's client animates itself.
+        steve.swing();
+        assert_eq!(ids(&mut alex_queue), [id::ANIMATE]);
+        assert!(ids(&mut steve_queue).is_empty());
+    }
+
+    #[test]
     fn player_metadata_makes_the_client_apply_gravity() {
-        let metadata = player_metadata("Steve");
+        let metadata = player_metadata("Steve", false);
         let flags = metadata
             .0
             .iter()

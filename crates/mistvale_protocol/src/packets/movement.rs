@@ -3,7 +3,17 @@
 use crate::io::{DecodeError, Reader, Writer};
 use crate::packet::{Decode, Encode, Packet, id};
 use crate::packets::BlockAction;
+use crate::packets::inventory::skip_embedded_use_item;
 use crate::types::{Vec2, Vec3};
+
+/// PlayerAuthInput input flag IDs, as gophertunnel numbers them; Mojang's
+/// PlayerActionType descriptions confirm the ones given there.
+pub mod input_flag {
+    pub const START_SNEAKING: i32 = 27;
+    pub const STOP_SNEAKING: i32 = 28;
+    /// Swinging at nothing (left-clicking air).
+    pub const MISSED_SWING: i32 = 39;
+}
 
 /// Most input flags a PlayerAuthInput may list; the protocol defines about 65.
 const MAX_INPUT_FLAGS: u32 = 128;
@@ -93,7 +103,7 @@ impl Decode for PlayerAuthInput {
 /// stack request stands in the way.
 fn read_block_actions(reader: &mut Reader<'_>) -> Result<Option<Vec<BlockAction>>, DecodeError> {
     if reader.bool()? {
-        skip_item_use_transaction(reader)?;
+        skip_embedded_use_item(reader)?;
     }
     if reader.bool()? {
         return Ok(None);
@@ -116,75 +126,6 @@ fn read_block_actions(reader: &mut Reader<'_>) -> Result<Option<Vec<BlockAction>
 
 /// Most block actions a PlayerAuthInput may carry.
 const MAX_BLOCK_ACTIONS: u32 = 64;
-
-/// Most entries in any list inside an item interaction.
-const MAX_LIST: u32 = 256;
-
-fn list_len(reader: &mut Reader<'_>, field: &'static str) -> Result<u32, DecodeError> {
-    let count = reader.var_u32()?;
-    if count > MAX_LIST {
-        return Err(DecodeError::InvalidValue {
-            field,
-            value: count.into(),
-        });
-    }
-    Ok(count)
-}
-
-/// Steps over an item-use transaction (placing, using an item on a block),
-/// as laid out by gophertunnel's `PlayerInventoryAction`.
-fn skip_item_use_transaction(reader: &mut Reader<'_>) -> Result<(), DecodeError> {
-    // Legacy request ID, then optional legacy slots: container ID and slot bytes.
-    reader.var_i32()?;
-    if reader.bool()? {
-        for _ in 0..list_len(reader, "legacy slot count")? {
-            reader.u8()?;
-            reader.byte_array()?;
-        }
-    }
-    // Inventory actions: source type, optional window ID and flags, slot, items.
-    for _ in 0..list_len(reader, "inventory action count")? {
-        reader.var_u32()?;
-        if reader.bool()? {
-            reader.u8()?;
-        }
-        if reader.bool()? {
-            reader.var_u32()?;
-        }
-        reader.var_u32()?;
-        skip_item_instance(reader)?;
-        skip_item_instance(reader)?;
-    }
-    // Action and trigger type, block position and face, hotbar slot, hand,
-    // held item, positions, block runtime ID, prediction and cooldown state.
-    reader.var_i32()?;
-    reader.u8()?;
-    crate::types::BlockPos::read(reader)?;
-    reader.u8()?;
-    reader.var_i32()?;
-    reader.u8()?;
-    skip_item_instance(reader)?;
-    Vec3::read(reader)?;
-    Vec3::read(reader)?;
-    reader.var_u32()?;
-    reader.u8()?;
-    reader.u8()?;
-    Ok(())
-}
-
-/// Steps over an item instance: network ID, count, metadata, optional stack
-/// network ID, block runtime ID and the user data blob.
-fn skip_item_instance(reader: &mut Reader<'_>) -> Result<(), DecodeError> {
-    reader.u16_le()?;
-    reader.u16_le()?;
-    reader.var_u32()?;
-    if reader.bool()? {
-        reader.var_i32()?;
-    }
-    reader.var_u32()?;
-    reader.byte_array()?;
-    Ok(())
-}
 
 impl Encode for PlayerAuthInput {
     /// Writes the decoded fields followed by empty optional fields and zero
