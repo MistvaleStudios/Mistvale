@@ -90,7 +90,7 @@ async fn the_sample_plugin_welcomes_a_joining_player_once() {
         texts,
         [
             "§eWelcome to Mistvale, Steve!",
-            "§7Only you can see this. Say §f!kickme§7 to test kicking."
+            "§7Only you can see this. Try §f!kickme§7 or §f!wave§7."
         ]
     );
 }

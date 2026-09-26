@@ -127,7 +127,7 @@ impl Server {
         match action {
             Action::Broadcast(message) => {
                 // Logged so the server log shows each chat line exactly as sent.
-                tracing::info!(target: "chat", recipients = self.players.count(), "[broadcast] {message}");
+                tracing::info!(target: "chat", "[broadcast] {message}");
                 self.players.broadcast_message(&message);
             }
             Action::SendMessage { player, message } => {

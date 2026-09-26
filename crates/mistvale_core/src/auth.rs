@@ -193,7 +193,7 @@ impl Authenticator {
             cache.last_attempt = Some(Instant::now());
             match fetch_keys(http).await {
                 Ok(keys) => {
-                    tracing::info!(
+                    tracing::debug!(
                         keys = keys.len(),
                         "fetched the authorization service's signing keys"
                     );

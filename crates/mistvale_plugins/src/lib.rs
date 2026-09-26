@@ -14,8 +14,8 @@
 //! Only the Luau engine exists so far; [`PluginHost`] runs Luau plugins.
 //! Plugins listen for game [`Event`]s with `server.on(name, handler)`, may
 //! cancel some (`player_chat`), and ask the server for [`Action`]s such as
-//! `server.broadcast(message)`, `server.send_message(player, message)` and
-//! `server.kick(player, reason)`.
+//! `server.broadcast(message)`, or, on a player from an event,
+//! `player.send_message(message)` and `player.kick(reason)`.
 
 mod api;
 #[cfg(feature = "luau")]
@@ -29,4 +29,4 @@ pub use api::{Action, BlockChange, Event, Player, Position};
 #[cfg(feature = "luau")]
 pub use host::{Dispatcher, PluginConfig, PluginError, PluginHost};
 pub use manifest::{MANIFEST_FILE, Manifest, ManifestError, PluginSource};
-pub use output::{Output, tracing_output};
+pub use output::{Output, PLUGIN_FIELD, PLUGIN_TARGET, tracing_output};

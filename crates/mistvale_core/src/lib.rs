@@ -8,6 +8,8 @@
 use std::time::Duration;
 
 pub mod auth;
+pub mod config;
+pub mod console;
 pub mod inventory;
 pub mod logins;
 pub mod players;

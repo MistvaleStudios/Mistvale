@@ -98,6 +98,7 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
     serve(&mut connection, &server, &mut session).await;
     // However the session ended, remember where the player left.
     if let Some((uuid, player)) = session.saved_player() {
+        tracing::info!(%uuid, "{} left the game", session.player());
         server.save_player(uuid, &player);
     }
 }
@@ -244,8 +245,9 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                                     None => false,
                                 };
                                 if cancelled {
-                                    tracing::info!(target: "chat", "[cancelled by a plugin] <{}> {message}", session.player());
+                                    tracing::info!(target: "chat", "[cancelled] <{}> {message}", session.player());
                                 } else {
+                                    tracing::info!(target: "chat", "<{}> {message}", session.player());
                                     server.players.chat(session.player(), &message);
                                 }
                             }
@@ -680,7 +682,7 @@ impl Session {
             self.flying = saved.flying;
             tracing::debug!(uuid = %self.uuid, ?saved, "restored the player's position");
         }
-        tracing::info!(name = %self.player, uuid = %self.uuid, "player logged in");
+        tracing::debug!(name = %self.player, uuid = %self.uuid, "player logged in");
         self.stage = Stage::ResourcePacks;
         Reply {
             packets: vec![
@@ -874,7 +876,7 @@ impl Session {
             return Reply::default();
         }
         self.stage = Stage::InGame;
-        tracing::info!(player = %self.player, entity_id = self.entity_id, "player spawned in the world");
+        tracing::info!(uuid = %self.uuid, "{} joined the game", self.player);
         Reply {
             events: vec![SessionEvent::Joined {
                 profile: Profile {
@@ -1090,7 +1092,6 @@ impl Session {
                 format!("§cChat messages can be at most {MAX_CHAT_LENGTH} characters long.");
             return Reply::send(vec![Text::raw(warning).encode()]);
         }
-        tracing::info!(target: "chat", "<{}> {message}", self.player);
         Reply {
             events: vec![SessionEvent::Chat(message.to_owned())],
             ..Reply::default()

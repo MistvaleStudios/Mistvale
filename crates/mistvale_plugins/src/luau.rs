@@ -1,6 +1,6 @@
 //! Luau plugins, each running in its own sandboxed VM.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -26,12 +26,18 @@ pub(crate) struct Limits {
     pub execution: Duration,
 }
 
+/// The players plugins know are online, by UUID: those whose `player_join`
+/// plugins heard and whose `player_quit` they have not. Shared by every VM.
+#[derive(Clone, Default)]
+struct Roster(Rc<RefCell<BTreeMap<String, Player>>>);
+
 /// Runs Luau plugins by name. Lives on one thread, since Luau VMs are not `Send`.
 pub(crate) struct LuauEngine {
     limits: Limits,
     output: Output,
     actions: mpsc::Sender<Action>,
     plugins: BTreeMap<String, Plugin>,
+    roster: Roster,
 }
 
 struct Plugin {
@@ -47,6 +53,7 @@ impl LuauEngine {
             output,
             actions,
             plugins: BTreeMap::new(),
+            roster: Roster::default(),
         }
     }
 
@@ -76,10 +83,22 @@ impl LuauEngine {
     /// Calls every handler for `event`, plugin by plugin in name order. A
     /// handler that fails is logged and skipped. Returns whether a handler
     /// cancelled the event; later handlers still run and can check.
+    ///
+    /// A joining player can be looked up from `player_join` on, and a leaving
+    /// one until the `player_quit` handlers have run.
     pub fn dispatch(&self, event: &Event) -> bool {
+        if let Event::PlayerJoin(player) = event {
+            self.roster
+                .0
+                .borrow_mut()
+                .insert(player.uuid.clone(), player.clone());
+        }
         let cancelled = Rc::new(Cell::new(false));
         for (name, plugin) in &self.plugins {
             plugin.dispatch(name, event, &cancelled, self.limits.execution);
+        }
+        if let Event::PlayerQuit(player) = event {
+            self.roster.0.borrow_mut().remove(&player.uuid);
         }
         cancelled.get()
     }
@@ -89,7 +108,7 @@ impl LuauEngine {
         lua.set_memory_limit(self.limits.memory)?;
         // Globals become read-only once sandboxed, so install ours first.
         install_output(&lua, name, &self.output)?;
-        install_server(&lua, &self.actions)?;
+        install_server(&lua, &self.actions, &self.roster)?;
         lua.sandbox(true)?;
 
         let deadline = Rc::new(Cell::new(None::<Instant>));
@@ -160,7 +179,7 @@ impl Plugin {
 
 /// The value handlers receive: a read-only table describing the event.
 ///
-/// - `player_join`, `player_quit`: the player, `{ name, uuid }`.
+/// - `player_join`, `player_quit`: the player (see [`player_table`]).
 /// - `player_chat`: `{ player, message, cancel(), is_cancelled() }`.
 /// - `block_break`, `block_place`: `{ player, position = { x, y, z }, block }`.
 fn event_payload(lua: &Lua, event: &Event, cancelled: &Rc<Cell<bool>>) -> mlua::Result<Table> {
@@ -204,31 +223,77 @@ fn event_payload(lua: &Lua, event: &Event, cancelled: &Rc<Cell<bool>>) -> mlua::
     Ok(payload)
 }
 
+/// A player as handlers see them: `{ name, uuid, send_message(message),
+/// kick(reason?) }`. The methods work with `.` and `:` alike, and keep working
+/// after the event; acting on a player who has left does nothing.
 fn player_table(lua: &Lua, player: &Player) -> mlua::Result<Table> {
+    let actions = lua
+        .app_data_ref::<mpsc::Sender<Action>>()
+        .ok_or_else(|| mlua::Error::runtime("the plugin API is not installed"))?
+        .clone();
     let table = lua.create_table()?;
     table.raw_set("name", player.name.as_str())?;
     table.raw_set("uuid", player.uuid.as_str())?;
+
+    let (queue, uuid) = (actions.clone(), player.uuid.clone());
+    let send_message = lua.create_function(move |_, args: MultiValue| {
+        let message = match method_args(args).next() {
+            Some(Value::String(message)) => message.to_str()?.to_owned(),
+            _ => {
+                return Err(mlua::Error::runtime(
+                    "send_message expects a message string",
+                ));
+            }
+        };
+        if message.is_empty() {
+            return Err(mlua::Error::runtime("cannot send an empty message"));
+        }
+        request(
+            &queue,
+            Action::SendMessage {
+                player: uuid.clone(),
+                message,
+            },
+        )
+    })?;
+    table.raw_set("send_message", send_message)?;
+
+    let uuid = player.uuid.clone();
+    let kick = lua.create_function(move |_, args: MultiValue| {
+        let reason = match method_args(args).next() {
+            Some(Value::String(reason)) if !reason.as_bytes().is_empty() => {
+                reason.to_str()?.to_owned()
+            }
+            None | Some(Value::Nil | Value::String(_)) => DEFAULT_KICK_REASON.to_owned(),
+            Some(other) => {
+                return Err(mlua::Error::runtime(format!(
+                    "kick expects a reason string, got a {}",
+                    other.type_name()
+                )));
+            }
+        };
+        request(
+            &actions,
+            Action::Kick {
+                player: uuid.clone(),
+                reason,
+            },
+        )
+    })?;
+    table.raw_set("kick", kick)?;
+
     table.set_readonly(true);
     Ok(table)
 }
 
-/// The UUID of the player a plugin means: a player table from an event, or
-/// the UUID string itself.
-fn player_uuid(player: Value) -> mlua::Result<String> {
-    let uuid = match player {
-        Value::String(uuid) => uuid.to_str()?.to_owned(),
-        Value::Table(player) => player.get::<String>("uuid")?,
-        other => {
-            return Err(mlua::Error::runtime(format!(
-                "expected a player or a player's UUID, got a {}",
-                other.type_name()
-            )));
-        }
-    };
-    if uuid.is_empty() {
-        return Err(mlua::Error::runtime("the player's UUID is empty"));
+/// A method's arguments without `self`, so `player:kick()` works like
+/// `player.kick()`. A player method never takes a table otherwise.
+fn method_args(args: MultiValue) -> impl Iterator<Item = Value> {
+    let mut args = args.into_iter().peekable();
+    if matches!(args.peek(), Some(Value::Table(_))) {
+        args.next();
     }
-    Ok(uuid)
+    args
 }
 
 /// Queues `action` for the server.
@@ -245,12 +310,13 @@ fn request(actions: &mpsc::Sender<Action>, action: Action) -> mlua::Result<()> {
 /// Adds the `server` table:
 /// - `server.on(event, handler)` registers an event handler;
 /// - `server.broadcast(message)` sends a chat message to everyone;
-/// - `server.send_message(player, message)` sends one to a single player;
-/// - `server.kick(player, reason?)` disconnects a player.
+/// - `server.player(uuid)` is the online player with that UUID, or `nil`.
 ///
-/// Players are given as a player table from an event or as a UUID string.
-fn install_server(lua: &Lua, actions: &mpsc::Sender<Action>) -> mlua::Result<()> {
+/// Actions on one player are methods of player tables.
+fn install_server(lua: &Lua, actions: &mpsc::Sender<Action>, roster: &Roster) -> mlua::Result<()> {
     lua.set_named_registry_value(HANDLERS, lua.create_table()?)?;
+    // Player tables built for events queue their actions here.
+    lua.set_app_data(actions.clone());
     let server = lua.create_table()?;
 
     let on = lua.create_function(|lua, (event, handler): (String, Function)| {
@@ -282,25 +348,13 @@ fn install_server(lua: &Lua, actions: &mpsc::Sender<Action>) -> mlua::Result<()>
     })?;
     server.set("broadcast", broadcast)?;
 
-    let queue = actions.clone();
-    let send_message = lua.create_function(move |_, (player, message): (Value, String)| {
-        let player = player_uuid(player)?;
-        if message.is_empty() {
-            return Err(mlua::Error::runtime("cannot send an empty message"));
-        }
-        request(&queue, Action::SendMessage { player, message })
+    let roster = roster.clone();
+    let player = lua.create_function(move |lua, uuid: String| {
+        // UUIDs are written in lower case; accept any case.
+        let found = roster.0.borrow().get(&uuid.to_ascii_lowercase()).cloned();
+        found.map(|player| player_table(lua, &player)).transpose()
     })?;
-    server.set("send_message", send_message)?;
-
-    let queue = actions.clone();
-    let kick = lua.create_function(move |_, (player, reason): (Value, Option<String>)| {
-        let player = player_uuid(player)?;
-        let reason = reason
-            .filter(|reason| !reason.is_empty())
-            .unwrap_or_else(|| DEFAULT_KICK_REASON.to_owned());
-        request(&queue, Action::Kick { player, reason })
-    })?;
-    server.set("kick", kick)?;
+    server.set("player", player)?;
 
     lua.globals().set("server", server)
 }
@@ -706,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn plugins_can_message_and_kick_single_players() {
+    fn players_can_be_messaged_and_kicked_through_their_methods() {
         let (mut engine, _, mut actions) = engine_with_actions(DEFAULT_LIMITS);
         engine
             .load(
@@ -714,15 +768,21 @@ mod tests {
                 "moderator.luau",
                 r#"
                     server.on("player_join", function(player)
-                        server.send_message(player, "Only you can see this")
-                        server.send_message(player.uuid, "And this")
-                        server.kick(player, "Come back later")
-                        server.kick(player.uuid)
+                        player.send_message("Only you can see this")
+                        player:send_message("And this")
+                    end)
+                    server.on("player_chat", function(event)
+                        event.player.kick("Come back later")
+                        event.player:kick()
                     end)
                 "#,
             )
             .unwrap();
         engine.dispatch(&steve_joins());
+        engine.dispatch(&Event::PlayerChat {
+            player: steve(),
+            message: "hi".into(),
+        });
         let uuid = steve().uuid;
         let received: Vec<_> = std::iter::from_fn(|| actions.try_recv().ok()).collect();
         assert_eq!(
@@ -749,15 +809,101 @@ mod tests {
     }
 
     #[test]
-    fn player_actions_need_a_player() {
-        let (mut engine, _) = default_engine();
-        for script in [
-            r#"server.send_message(42, "hi")"#,
-            r#"server.send_message("", "hi")"#,
-            r#"server.send_message({}, "hi")"#,
-            r#"server.kick(nil)"#,
-        ] {
-            assert!(engine.load("bad", "bad.luau", script).is_err(), "{script}");
-        }
+    fn player_methods_check_their_arguments_and_players_are_read_only() {
+        let (mut engine, lines, mut actions) = engine_with_actions(DEFAULT_LIMITS);
+        engine
+            .load(
+                "careless",
+                "careless.luau",
+                r#"
+                    server.on("player_join", function(player)
+                        for _, attempt in {
+                            function() player.send_message() end,
+                            function() player.send_message("") end,
+                            function() player.send_message(42) end,
+                            function() player.kick(false) end,
+                            function() player.name = "Alex" end,
+                            function() player.kick = nil end,
+                        } do
+                            print(pcall(attempt))
+                        end
+                    end)
+                "#,
+            )
+            .unwrap();
+        engine.dispatch(&steve_joins());
+        let results = messages(&lines);
+        assert_eq!(results.len(), 6);
+        assert!(
+            results.iter().all(|line| line.starts_with("false")),
+            "{results:?}"
+        );
+        assert!(actions.try_recv().is_err(), "nothing was sent");
+    }
+
+    #[test]
+    fn online_players_can_be_looked_up_by_uuid() {
+        let (mut engine, lines, mut actions) = engine_with_actions(DEFAULT_LIMITS);
+        engine
+            .load(
+                "lookup",
+                "lookup.luau",
+                r#"
+                    local uuid = "174319CC-F69F-30D8-A279-6ACE57F2011E"
+                    local function show(when)
+                        local player = server.player(uuid)
+                        print(when, player and player.name)
+                    end
+                    show("before")
+                    server.on("player_join", function() show("join") end)
+                    server.on("player_quit", function() show("quit") end)
+                    server.on("block_break", function()
+                        show("later")
+                        local player = server.player(uuid)
+                        if player then player.send_message("found you") end
+                    end)
+                "#,
+            )
+            .unwrap();
+        let block_break = || {
+            Event::BlockBreak(crate::BlockChange {
+                player: steve(),
+                position: crate::Position { x: 0, y: 0, z: 0 },
+                block: "minecraft:dirt".into(),
+            })
+        };
+        engine.dispatch(&steve_joins());
+        engine.dispatch(&block_break());
+        engine.dispatch(&Event::PlayerQuit(steve()));
+        engine.dispatch(&block_break());
+        assert_eq!(
+            messages(&lines),
+            [
+                "before\tnil",
+                "join\tSteve",
+                "later\tSteve",
+                "quit\tSteve",
+                "later\tnil"
+            ]
+        );
+        assert_eq!(
+            actions.try_recv().unwrap(),
+            Action::SendMessage {
+                player: steve().uuid,
+                message: "found you".into()
+            }
+        );
+        assert!(actions.try_recv().is_err());
+
+        // A plugin loaded later sees who is already online.
+        engine.dispatch(&steve_joins());
+        engine
+            .load(
+                "late",
+                "late.luau",
+                r#"print(server.player("174319cc-f69f-30d8-a279-6ace57f2011e").name)"#,
+            )
+            .unwrap();
+        assert_eq!(messages(&lines).last().unwrap(), "Steve");
     }
 }

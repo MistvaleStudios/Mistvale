@@ -781,8 +781,8 @@ DTLS, SCTP, and multi-segment messages both ways.
 
   | Event | Handler receives | When |
   |---|---|---|
-  | `player_join` | the player, `{ name, uuid }` | 750 ms after the player spawns |
-  | `player_quit` | the player, `{ name, uuid }` | when the session of a player whose join plugins heard ends, however it ends |
+  | `player_join` | the player | 750 ms after the player spawns |
+  | `player_quit` | the player | when the session of a player whose join plugins heard ends, however it ends |
   | `player_chat` | `{ player, message, cancel(), is_cancelled() }` | before a chat message is relayed; `cancel()` stops it, and later handlers still run and can check |
   | `block_break` | `{ player, position = { x, y, z }, block }` | after a player broke a block; `block` is the broken block's name |
   | `block_place` | `{ player, position = { x, y, z }, block }` | after a player placed a block |
@@ -792,13 +792,38 @@ DTLS, SCTP, and multi-segment messages both ways.
   - `server.on(event, handler)`: unknown event names are an error. Handlers live in
     the VM's registry, so a reload drops the old ones with the old VM.
   - `server.broadcast(message)`: System chat to every player.
-  - `server.send_message(player, message)`: System chat to one player in the world.
-  - `server.kick(player, reason?)`: disconnects a logged-in player with reason 55
-    (Kicked), showing `reason` or "You were kicked from the server.". Core delivers
-    it through the same per-UUID channel as the duplicate-login kick.
-  - `player` is a player table from an event or a UUID string. Empty messages and
-    anything else as `player` are Lua errors; unknown or offline players are ignored.
+  - `server.player(uuid)`: the online player with that UUID (any case) as a player
+    table, or `nil`. The engine keeps its own roster from the events it delivers,
+    so no round trip to the game thread is needed: a player can be looked up from
+    their `player_join` until their `player_quit` handlers finish, and plugins
+    loaded later see everyone already online.
   - The `server` table is read-only after sandboxing.
+  - Every player in an event is a read-only table `{ name, uuid, send_message, kick }`.
+    The methods work with `.` and `:` alike and keep working after the event; acting
+    on a player who has left does nothing.
+    - `player.send_message(message)`: System chat to that player only.
+    - `player.kick(reason?)`: disconnects them with reason 55 (Kicked), showing
+      `reason` or "You were kicked from the server.". Core delivers it through the
+      same per-UUID channel as the duplicate-login kick.
+    - A missing, empty or non-string message and a non-string reason are Lua errors.
+- **Console (implemented)** in `mistvale_core::console`. `ConsoleFormat` prints
+  `<YY/MM/DD HH:MM:SS.SSS> LEVEL [target] message key=value…`, for example
+  `<26/09/26 14:30:05.123> INF [hello] Hello from Luau!`:
+  - local time (chrono) in grey, to the millisecond;
+  - `INF`, `WRN`, `ERR` in green, yellow, red (`DBG` blue, `TRC` magenta);
+  - the target in cyan brackets: the plugin's manifest name for plugin output
+    (`tracing` targets are fixed at compile time, so plugins log under `plugin` with
+    a `plugin` field), `mistvale` for the core, otherwise the logging crate
+    (`mistvale_net`, `mistvale_plugins`, `chat`, libraries);
+  - the message in the default colour, then other fields as grey `key=` and value;
+  - Bedrock's `§` codes as 24-bit ANSI colours (the material colours included; `§l`
+    bold, `§o` italic, `§r` reset, `§k` dropped), or stripped when stdout is not a
+    terminal or `NO_COLOR` is set.
+
+  Chat (`<name> message`), broadcasts, private messages and cancelled chat are
+  logged at info under the `chat` target, and each join and leave as "<name> joined
+  the game" / "left the game". Connections, logins, key fetches, chunk streaming,
+  saves and refused actions are debug-level system noise.
 - **Plugin folders and manifests (implemented)** in `mistvale_plugins::manifest`. Each
   plugin is a folder in `plugins/` holding a `plugin.json`:
 
@@ -847,7 +872,21 @@ DTLS, SCTP, and multi-segment messages both ways.
 - **Profiles:** the dev profile optimizes dependencies (opt-level 2), because pure-Rust
   crypto, compression and the Luau VM are very slow unoptimized. Release builds use
   thin LTO with line-table debug info.
-- **Configuration:** a `mistvale.toml` file is planned.
+- **Configuration (implemented)** in `mistvale_core::config`: `mistvale.toml` in the
+  working directory, written with every setting at its default and comments the
+  first time the server starts (git-ignored). Missing settings keep their defaults;
+  unknown keys and wrong types stop startup with the line at fault.
+
+  ```toml
+  [logs]
+  chat = true           # the `chat` target at info, or off
+  system_noise = false  # our crates at debug and libraries at info, instead of info and warn
+  ```
+
+  `[logs]` becomes the log filter, e.g. `warn,mistvale=info,plugin=info,chat=info`
+  (targets match by prefix, so `mistvale` covers every crate). `RUST_LOG`, when set,
+  replaces it. Network settings and the world directory are still environment
+  variables.
 
 ## 5. Approved decisions (2026-09-25)
 
@@ -898,7 +937,10 @@ Each step starts only after explicit confirmation.
 | 15 | Player persistence and spawn: `players/<uuid>.json` (feet position and rotation) saved on leave, every 5 s and at shutdown, restored at login; new players spawn at (0, -60, 0); broadcasts logged under the `chat` target | Rejoining puts you where you left; new players start at 0, 0 | ✅ done 2026-09-26; position and view direction restore on rejoin |
 | 16 | Flying state saved and restored (UpdateAbilities answers StartFlying and StopFlying); storage behind the `WorldStorage` trait with chunk format v2 (palettes of block names and states; v1 still read); server broadcasts as System text | Leaving while flying, you rejoin in the air; old and new chunk files load | ✅ done 2026-09-26; flying, spawn and old chunk files all work (commit `e816e16`) |
 | 17 | Authentication: Login tokens verified (RS256 against the authorization service's published keys; issuer, audience and lifetime checked) before the login continues; the verified UUID is used everywhere; a second login for the same UUID kicks the older session (reason 43, "logged in from another location") | A signed-in client joins; a second device on the same account kicks the first; a forged token is refused | ✅ done 2026-09-26; a signed-in PC and Android client joined, and a second login on the same account showed the first "logged in from another location" (commit `3f53b65`) |
-| 18 | Plugin API: plugins in folders with a `plugin.json` manifest (name, description, version, author, main); events `player_quit`, `player_chat` (cancellable), `block_break`, `block_place`; actions `server.send_message(player, message)` and `server.kick(player, reason?)` | The sample plugin greets a player privately, blocks a filtered word, kicks on `!kickme`, logs block changes and announces leaving | ✅ done 2026-09-26; folders, manifests, every event and action, and hot reload all worked live |
+| 18 | Plugin API: plugins in folders with a `plugin.json` manifest (name, description, version, author, main); events `player_quit`, `player_chat` (cancellable), `block_break`, `block_place`; actions `server.send_message(player, message)` and `server.kick(player, reason?)` | The sample plugin greets a player privately, blocks a filtered word, kicks on `!kickme`, logs block changes and announces leaving | ✅ done 2026-09-26; folders, manifests, every event and action, and hot reload all worked live (commit `7cf9259`) |
+| 19 | Plugin API and console polish: `player.send_message(message)` and `player.kick(reason?)` methods replace the `server.*` versions; plugin output labelled with the plugin's name; `§` colour codes shown as terminal colours; chat logs moved to debug | The sample plugin works as before; the console shows `hello:` lines and the welcome in yellow, and no chat lines | ✅ done 2026-09-26; methods, plugin names and colours all worked live |
+| 20 | `mistvale.toml` created with defaults; `[logs] chat` and `system_noise` set the console filter; chat back at info; connection, login and key-fetch lines moved to debug; one "joined/left the game" line per player; `server.player(uuid)` | A fresh start writes the file; chat shows or hides with `chat`; debug lines appear with `system_noise`; `!wave` reaches the newest player | ✅ done 2026-09-26; config, log toggles and lookup all worked live |
+| 21 | Console lines as `<YY/MM/DD HH:MM:SS.SSS> LEVEL [target] message` in local time, with grey time, coloured three-letter levels and cyan targets | The console shows `INF [hello]` and `INF [mistvale]` lines in colour | ✅ done 2026-09-26; the format and colours look right (seconds added after the first test) |
 
 Later steps are proposed but not yet scheduled:
 - vanilla item and biome data (ItemRegistry, BiomeDefinitionList, CreativeContent)

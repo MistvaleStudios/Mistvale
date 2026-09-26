@@ -11,14 +11,23 @@
 //! `MISTVALE_WORLD_DIR` sets where the world is saved (default `world`), and
 //! `MISTVALE_AUTHENTICATION=false` turns off checking players' sign-in (offline
 //! testing only: anyone can then join as anyone).
+//!
+//! What the console shows is set in `mistvale.toml` (see [`config`]), created
+//! with defaults on first run. `RUST_LOG`, when set, overrides it; chat is
+//! logged under the `chat` target. `NO_COLOR` turns colours off.
+//!
+//! [`config`]: mistvale_core::config
 
+use std::io::IsTerminal as _;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Context as _;
 use mistvale_core::auth::Authenticator;
+use mistvale_core::config::{CONFIG_FILE, Config};
+use mistvale_core::console::ConsoleFormat;
 use mistvale_core::server::{self, PLUGIN_ACTION_QUEUE, Server};
 use mistvale_core::session;
 use mistvale_core::tick::TickLoop;
@@ -30,11 +39,23 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let loaded = Config::load_or_create(Path::new(CONFIG_FILE))?;
+    // `RUST_LOG`, when set, replaces the filter the configuration asks for.
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(directives) if !directives.trim().is_empty() => {
+            EnvFilter::try_new(&directives).context("invalid RUST_LOG")?
+        }
+        _ => EnvFilter::new(loaded.config.logs.filter()),
+    };
+    // Colours only for a terminal, and never with NO_COLOR set (no-color.org).
+    let ansi = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(filter)
+        .event_format(ConsoleFormat { ansi })
         .init();
+    if loaded.created {
+        tracing::info!("created {CONFIG_FILE} with the default settings");
+    }
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -114,13 +135,13 @@ async fn main() -> anyhow::Result<()> {
 /// Runs a client's protocol session until it disconnects.
 async fn serve(connection: Connection, server: Arc<Server>) {
     let network_id = connection.network_id();
-    tracing::info!(
+    tracing::debug!(
         network_id,
         issuer = ?connection.client_identity().map(|identity| &identity.issuer),
         "client connected"
     );
     session::run(connection, server).await;
-    tracing::info!(network_id, "client disconnected");
+    tracing::debug!(network_id, "client disconnected");
 }
 
 fn listener_config() -> anyhow::Result<ListenerConfig> {

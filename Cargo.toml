@@ -48,9 +48,13 @@ serde_json = "1.0.151"
 flate2 = "1.1.10"
 snap = "1.1.2"
 
+# Console timestamps, in local time
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+
 # Diagnostics & errors
 anyhow = "1.0.104"
 thiserror = "2.0.21"
+toml = { version = "1.1.6", default-features = false, features = ["std", "serde", "parse"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 

@@ -6,3 +6,6 @@
 
 # World data saved by the server.
 /world/
+
+# The server configuration, created with defaults on first run.
+/mistvale.toml
