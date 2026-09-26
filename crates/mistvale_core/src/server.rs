@@ -38,7 +38,7 @@ impl Server {
     /// Advances the world by one tick; called by the game loop.
     pub fn tick(&self, tick: u64) {
         self.tick.store(tick, Ordering::Relaxed);
-        self.players.broadcast_movement(tick);
+        self.players.tick(tick);
     }
 
     /// Carries out one plugin action.

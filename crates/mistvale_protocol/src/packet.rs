@@ -15,6 +15,7 @@ pub mod id {
     pub const ADD_PLAYER: u32 = 12;
     pub const REMOVE_ACTOR: u32 = 14;
     pub const MOVE_PLAYER: u32 = 19;
+    pub const SET_ACTOR_DATA: u32 = 39;
     pub const LEVEL_CHUNK: u32 = 58;
     pub const PLAYER_LIST: u32 = 63;
     pub const REQUEST_CHUNK_RADIUS: u32 = 69;

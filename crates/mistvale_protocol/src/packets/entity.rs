@@ -18,6 +18,48 @@ pub mod metadata_key {
     pub const ALWAYS_SHOW_NAME_TAG: u32 = 81;
 }
 
+/// Bits of the [`metadata_key::FLAGS`] long, as gophertunnel and PocketMine
+/// both number them.
+pub mod entity_flag {
+    pub const SNEAKING: u32 = 1;
+    pub const SHOW_NAME: u32 = 14;
+    pub const ALWAYS_SHOW_NAME: u32 = 15;
+    pub const CAN_CLIMB: u32 = 19;
+    pub const BREATHING: u32 = 35;
+    pub const HAS_COLLISION: u32 = 48;
+    /// Without it, the client does not pull the entity down, the local player included.
+    pub const HAS_GRAVITY: u32 = 49;
+
+    /// The flags long with each listed bit set.
+    pub fn bits(flags: &[u32]) -> i64 {
+        flags.iter().fold(0, |bits, flag| bits | (1 << flag))
+    }
+}
+
+/// Updates an entity's metadata, including the player's own entity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetActorData {
+    pub entity_runtime_id: u64,
+    pub metadata: EntityMetadata,
+    /// The server tick the data belongs to.
+    pub tick: u64,
+}
+
+impl Packet for SetActorData {
+    const ID: u32 = id::SET_ACTOR_DATA;
+}
+
+impl Encode for SetActorData {
+    fn encode_payload(&self, writer: &mut Writer) {
+        writer.var_u64(self.entity_runtime_id);
+        self.metadata.write(writer);
+        // No integer or float entity properties.
+        writer.var_u32(0);
+        writer.var_u32(0);
+        writer.var_u64(self.tick);
+    }
+}
+
 /// A value of entity metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetadataValue {
@@ -371,6 +413,23 @@ mod tests {
         let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
         assert!(contains(HUMANOID_GEOMETRY.as_bytes()));
         assert!(contains(b"\x050.0.0"));
+    }
+
+    #[test]
+    fn set_actor_data_layout() {
+        let packet = SetActorData {
+            entity_runtime_id: 1,
+            metadata: EntityMetadata(vec![(
+                metadata_key::FLAGS,
+                MetadataValue::Long(entity_flag::bits(&[entity_flag::HAS_GRAVITY])),
+            )]),
+            tick: 0,
+        };
+        let mut expected = vec![0x27, 0x01, 0x01, 0x00, 0x07, 0x07];
+        // 1 << 49, zigzagged: 1 << 50 as a varint.
+        expected.extend([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]);
+        expected.extend([0x00, 0x00, 0x00]);
+        assert_eq!(packet.encode(), expected);
     }
 
     #[test]

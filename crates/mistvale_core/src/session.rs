@@ -33,15 +33,17 @@ use mistvale_protocol::packets::{
     EXEMPTED_PACKS, GameRule, GameRuleValue, ItemRegistry, JigsawStructureData, Login,
     NetworkChunkPublisherUpdate, NetworkSettings, PackResponse, PlayStatus, PlayStatusCode,
     PlayerAuthInput, PlayerMovementSettings, RequestChunkRadius, RequestNetworkSettings,
-    ResourcePackClientResponse, ResourcePackStack, ResourcePacksInfo, SetLocalPlayerAsInitialized,
-    StackPack, StartGame, Text, TextType, VoxelShapes,
+    ResourcePackClientResponse, ResourcePackStack, ResourcePacksInfo, SetActorData,
+    SetLocalPlayerAsInitialized, StackPack, StartGame, Text, TextType, VoxelShapes,
 };
 use mistvale_protocol::types::{BlockPos, ChunkPos, Vec3};
 use mistvale_protocol::{GAME_VERSION, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::players::{EYE_HEIGHT, Joining, Movement, OUTBOUND_QUEUE, Profile};
+use crate::players::{
+    EYE_HEIGHT, Joining, Movement, OUTBOUND_QUEUE, Profile, View, player_metadata,
+};
 use crate::server::Server;
 use crate::view::ChunkView;
 use crate::world::{FlatWorld, OVERWORLD};
@@ -105,7 +107,7 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
                     }
                     for event in reply.events {
                         match event {
-                            SessionEvent::Joined { profile, movement } => {
+                            SessionEvent::Joined { profile, movement, view } => {
                                 let player = Player {
                                     name: profile.name.clone(),
                                     uuid: profile.uuid.to_string(),
@@ -115,6 +117,7 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
                                     entity_id,
                                     profile,
                                     movement,
+                                    view,
                                     outbound: outbound.clone(),
                                 }));
                                 server.plugins.dispatch(Event::PlayerJoin(player));
@@ -122,6 +125,11 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
                             SessionEvent::Moved(movement) => {
                                 if let Some(membership) = &membership {
                                     membership.moved(movement);
+                                }
+                            }
+                            SessionEvent::Viewing(view) => {
+                                if let Some(membership) = &membership {
+                                    membership.viewing(view);
                                 }
                             }
                             SessionEvent::Chat(message) => {
@@ -199,9 +207,12 @@ pub enum SessionEvent {
     Joined {
         profile: Profile,
         movement: Movement,
+        view: View,
     },
     /// The player moved or looked around.
     Moved(Movement),
+    /// The player's client now shows a different set of chunks.
+    Viewing(View),
     /// The player said something in chat.
     Chat(String),
 }
@@ -496,6 +507,16 @@ impl Session {
         let mut packets = vec![ChunkRadiusUpdated { radius }.encode()];
         packets.extend(self.stream_chunks(radius));
         if self.stage == Stage::Spawning {
+            // The player's own entity data: without HasGravity the client
+            // does not pull its player down, and they float.
+            packets.push(
+                SetActorData {
+                    entity_runtime_id: self.entity_id,
+                    metadata: player_metadata(&self.player),
+                    tick: 0,
+                }
+                .encode(),
+            );
             packets.push(
                 PlayStatus {
                     status: PlayStatusCode::PlayerSpawn,
@@ -505,18 +526,30 @@ impl Session {
             packets.push(CreativeContent.encode());
             self.stage = Stage::Initializing;
         }
-        Reply::send(packets)
+        Reply {
+            packets,
+            events: self.view_event(),
+            ..Reply::default()
+        }
+    }
+
+    /// The chunks the client shows now, for the rest of the server once the
+    /// player is in the world.
+    fn view_event(&self) -> Vec<SessionEvent> {
+        match self.view.centre() {
+            Some(centre) if self.stage == Stage::InGame => vec![SessionEvent::Viewing(View {
+                centre,
+                radius: self.view.radius(),
+            })],
+            _ => Vec::new(),
+        }
     }
 
     /// Centres the view on the player's chunk: a NetworkChunkPublisherUpdate,
     /// so the client renders around its new position, then every chunk in
     /// range it does not have yet.
     fn stream_chunks(&mut self, radius: i32) -> Vec<Vec<u8>> {
-        let feet = Vec3 {
-            y: self.movement.position.y - EYE_HEIGHT,
-            ..self.movement.position
-        };
-        let block = BlockPos::containing(feet);
+        let block = BlockPos::containing(self.movement.feet());
         let centre = ChunkPos::of_block(block);
         let chunks = self.view.update(centre, radius);
 
@@ -562,6 +595,10 @@ impl Session {
                     uuid: self.uuid,
                 },
                 movement: self.movement,
+                view: View {
+                    centre: self.view.centre().unwrap_or_else(|| self.movement.chunk()),
+                    radius: self.view.radius(),
+                },
             }],
             ..Reply::default()
         }
@@ -592,19 +629,17 @@ impl Session {
         self.movement = movement;
 
         // Crossing into another chunk moves the view along with the player.
-        let feet = Vec3 {
-            y: movement.position.y - EYE_HEIGHT,
-            ..movement.position
-        };
-        let chunk = ChunkPos::of_block(BlockPos::containing(feet));
-        let packets = if self.view.crosses_into(chunk) {
-            self.stream_chunks(self.view.radius())
+        let mut events = vec![SessionEvent::Moved(movement)];
+        let packets = if self.view.crosses_into(movement.chunk()) {
+            let packets = self.stream_chunks(self.view.radius());
+            events.extend(self.view_event());
+            packets
         } else {
             Vec::new()
         };
         Reply {
             packets,
-            events: vec![SessionEvent::Moved(movement)],
+            events,
             ..Reply::default()
         }
     }
@@ -884,9 +919,10 @@ mod tests {
         // The chunks within a circle of radius 4: 49 of them.
         let chunks = sent.iter().filter(|id| **id == id::LEVEL_CHUNK).count();
         assert_eq!(chunks, 49);
+        // The player's own entity data (gravity!) comes just before PlayerSpawn.
         assert_eq!(
-            sent[sent.len() - 2..],
-            [id::PLAY_STATUS, id::CREATIVE_CONTENT]
+            sent[sent.len() - 3..],
+            [id::SET_ACTOR_DATA, id::PLAY_STATUS, id::CREATIVE_CONTENT]
         );
         let spawn: PlayStatus = decode_only(&reply.packets[sent.len() - 2]);
         assert_eq!(spawn.status, PlayStatusCode::PlayerSpawn);
@@ -1006,11 +1042,26 @@ mod tests {
             entity_runtime_id: PLAYER_ENTITY_ID,
         };
         let reply = session.handle(&initialized.encode()).unwrap();
-        let [SessionEvent::Joined { profile, movement }] = &reply.events[..] else {
+        let [
+            SessionEvent::Joined {
+                profile,
+                movement,
+                view,
+            },
+        ] = &reply.events[..]
+        else {
             panic!("expected a join, got {:?}", reply.events);
         };
         assert_eq!(profile.name, session.player());
         assert!(!profile.uuid.is_nil());
+        // Their client shows the chunks around the spawn.
+        assert_eq!(
+            *view,
+            View {
+                centre: ChunkPos::new(0, 0),
+                radius: 2
+            }
+        );
         // The player joins where StartGame put them: eyes above the spawn block.
         assert_eq!(
             movement.position,
@@ -1129,6 +1180,11 @@ mod tests {
         let streamed = chunks_in(&reply);
         assert!(streamed.contains(&(9, 0)), "{streamed:?}");
         assert!(streamed.iter().all(|chunk| !first.contains(chunk)));
+        // The rest of the server hears about the new view, for entity tracking.
+        assert!(reply.events.contains(&SessionEvent::Viewing(View {
+            centre: ChunkPos::new(1, 0),
+            radius: 8
+        })));
 
         // Coming back sends the west edge again, which the client unloaded.
         let reply = session.handle(&auth_input(within, 0.0)).unwrap();

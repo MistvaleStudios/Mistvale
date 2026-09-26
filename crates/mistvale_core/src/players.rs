@@ -1,11 +1,11 @@
 //! Who is in the world, where they are, and how to reach them.
 //!
-//! Players see each other: joining sends the newcomer a player list entry and
-//! an entity for everyone already here, and everyone else the same for the
-//! newcomer. Movement is recorded as it arrives and sent to the other players
-//! once per tick by [`Players::broadcast_movement`].
+//! Everyone online is in everyone's player list. Player *entities* are tracked
+//! per viewer: each tick, [`Players::tick`] shows a viewer the players standing
+//! in chunks within their view radius (AddPlayer), hides those who left it
+//! (RemoveActor), and sends the movement of the players they can see.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -13,9 +13,9 @@ use bytes::Bytes;
 use mistvale_protocol::packet::Encode;
 use mistvale_protocol::packets::{
     AddPlayer, EntityMetadata, MetadataValue, MoveMode, MovePlayer, PlayerList, PlayerListEntry,
-    RemoveActor, Skin, Text, metadata_key,
+    RemoveActor, Skin, Text, entity_flag, metadata_key,
 };
-use mistvale_protocol::types::Vec3;
+use mistvale_protocol::types::{BlockPos, ChunkPos, Vec3};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use uuid::Uuid;
 
@@ -47,6 +47,34 @@ pub struct Movement {
     pub on_ground: bool,
 }
 
+impl Movement {
+    /// Where the player's feet are.
+    pub fn feet(&self) -> Vec3 {
+        Vec3 {
+            y: self.position.y - EYE_HEIGHT,
+            ..self.position
+        }
+    }
+
+    /// The chunk column the player stands in.
+    pub fn chunk(&self) -> ChunkPos {
+        ChunkPos::of_block(BlockPos::containing(self.feet()))
+    }
+}
+
+/// The chunks a player's client shows: a circle of `radius` chunks around `centre`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct View {
+    pub centre: ChunkPos,
+    pub radius: i32,
+}
+
+impl View {
+    pub fn contains(&self, chunk: ChunkPos) -> bool {
+        chunk.distance_squared(self.centre) <= i64::from(self.radius).pow(2)
+    }
+}
+
 /// A player entering the world.
 pub struct Joining {
     /// The runtime and unique ID of the player's entity, from
@@ -54,14 +82,18 @@ pub struct Joining {
     pub entity_id: u64,
     pub profile: Profile,
     pub movement: Movement,
+    pub view: View,
     pub outbound: Outbound,
 }
 
 struct Online {
     profile: Profile,
     movement: Movement,
-    /// Whether `movement` changed since the last broadcast.
+    /// Whether `movement` changed since the last tick.
     moved: bool,
+    view: View,
+    /// Players whose entity this player's client has, by entity ID.
+    seen: HashSet<u64>,
     outbound: Outbound,
 }
 
@@ -91,43 +123,40 @@ impl Players {
         self.last_entity_id.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Adds a player and shows them and everyone already online to each other.
+    /// Adds a player and puts everyone in each other's player list. Entities
+    /// follow on the next tick, for those in view.
     pub fn join(&self, joining: Joining) -> Membership<'_> {
         let Joining {
             entity_id,
             profile,
             movement,
+            view,
             outbound,
         } = joining;
         let newcomer = Online {
             profile,
             movement,
             moved: false,
+            view,
+            seen: HashSet::new(),
             outbound,
         };
         let mut online = self.online();
 
-        let others: Vec<_> = online.iter().collect();
-        if !others.is_empty() {
-            let entries = others
+        if !online.is_empty() {
+            let entries = online
                 .iter()
-                .map(|(id, other)| list_entry(**id, &other.profile))
+                .map(|(id, other)| list_entry(*id, &other.profile))
                 .collect();
             newcomer.send(encode(&PlayerList::Add(entries)));
-            for (id, other) in &others {
-                newcomer.send(encode(&add_player(**id, &other.profile, &other.movement)));
+            let entry = encode(&PlayerList::Add(vec![list_entry(
+                entity_id,
+                &newcomer.profile,
+            )]));
+            for other in online.values() {
+                other.send(entry.clone());
             }
         }
-        let list = encode(&PlayerList::Add(vec![list_entry(
-            entity_id,
-            &newcomer.profile,
-        )]));
-        let entity = encode(&add_player(entity_id, &newcomer.profile, &movement));
-        for (_, other) in &others {
-            other.send(list.clone());
-            other.send(entity.clone());
-        }
-
         online.insert(entity_id, newcomer);
         Membership {
             players: self,
@@ -139,9 +168,41 @@ impl Players {
         self.online().len()
     }
 
-    /// Sends every player who moved since the last call to everyone else.
-    pub fn broadcast_movement(&self, tick: u64) {
+    /// Updates who sees whom, then sends everyone who moved to the players
+    /// who can see them.
+    pub fn tick(&self, tick: u64) {
         let mut online = self.online();
+        let snapshot: Vec<(u64, ChunkPos)> = online
+            .iter()
+            .map(|(id, player)| (*id, player.movement.chunk()))
+            .collect();
+
+        // Entities entering and leaving each viewer's view. A newly shown
+        // entity already carries its current position.
+        let mut shown: HashSet<(u64, u64)> = HashSet::new();
+        let mut spawns = Vec::new();
+        for (viewer_id, viewer) in online.iter_mut() {
+            for (target_id, chunk) in &snapshot {
+                if target_id == viewer_id {
+                    continue;
+                }
+                let visible = viewer.view.contains(*chunk);
+                if visible && viewer.seen.insert(*target_id) {
+                    shown.insert((*viewer_id, *target_id));
+                    spawns.push((*viewer_id, *target_id));
+                } else if !visible && viewer.seen.remove(target_id) {
+                    viewer.send(encode(&RemoveActor {
+                        entity_unique_id: unique_id(*target_id),
+                    }));
+                }
+            }
+        }
+        for (viewer_id, target_id) in spawns {
+            let target = &online[&target_id];
+            let packet = encode(&add_player(target_id, &target.profile, &target.movement));
+            online[&viewer_id].send(packet);
+        }
+
         let moved: Vec<(u64, Movement)> = online
             .iter_mut()
             .filter(|(_, player)| player.moved)
@@ -162,8 +223,10 @@ impl Players {
                 ridden_entity_runtime_id: 0,
                 tick,
             });
-            for (_, other) in online.iter().filter(|(id, _)| **id != mover) {
-                other.send(packet.clone());
+            for (viewer_id, viewer) in online.iter() {
+                if viewer.seen.contains(&mover) && !shown.contains(&(*viewer_id, mover)) {
+                    viewer.send(packet.clone());
+                }
             }
         }
     }
@@ -199,8 +262,8 @@ impl Players {
     }
 }
 
-/// A player's place in [`Players`]; dropping it removes the player and their
-/// entity from everyone's view.
+/// A player's place in [`Players`]; dropping it removes the player, their
+/// entity from everyone who sees it, and their player list entry.
 #[must_use = "the player leaves when this is dropped"]
 pub struct Membership<'a> {
     players: &'a Players,
@@ -215,6 +278,14 @@ impl Membership<'_> {
             player.moved = true;
         }
     }
+
+    /// Records the chunks the player's client now shows; entities follow on
+    /// the next tick.
+    pub fn viewing(&self, view: View) {
+        if let Some(player) = self.players.online().get_mut(&self.entity_id) {
+            player.view = view;
+        }
+    }
 }
 
 impl Drop for Membership<'_> {
@@ -227,11 +298,35 @@ impl Drop for Membership<'_> {
             entity_unique_id: unique_id(self.entity_id),
         });
         let list = encode(&PlayerList::Remove(vec![left.profile.uuid]));
-        for other in online.values() {
-            other.send(entity.clone());
+        for other in online.values_mut() {
+            if other.seen.remove(&self.entity_id) {
+                other.send(entity.clone());
+            }
             other.send(list.clone());
         }
     }
+}
+
+/// Metadata for a player's entity, for their own client and for others: their
+/// name, always shown, a player-sized box, and the flags that make the client
+/// apply gravity and collisions.
+pub fn player_metadata(name: &str) -> EntityMetadata {
+    let flags = entity_flag::bits(&[
+        entity_flag::HAS_GRAVITY,
+        entity_flag::HAS_COLLISION,
+        entity_flag::BREATHING,
+        entity_flag::CAN_CLIMB,
+        entity_flag::SHOW_NAME,
+        entity_flag::ALWAYS_SHOW_NAME,
+    ]);
+    EntityMetadata(vec![
+        (metadata_key::FLAGS, MetadataValue::Long(flags)),
+        (metadata_key::NAME, MetadataValue::String(name.to_owned())),
+        (metadata_key::SCALE, MetadataValue::Float(1.0)),
+        (metadata_key::WIDTH, MetadataValue::Float(0.6)),
+        (metadata_key::HEIGHT, MetadataValue::Float(1.8)),
+        (metadata_key::ALWAYS_SHOW_NAME_TAG, MetadataValue::Byte(1)),
+    ])
 }
 
 fn encode(packet: &impl Encode) -> Bytes {
@@ -262,25 +357,12 @@ fn add_player(entity_id: u64, profile: &Profile, movement: &Movement) -> AddPlay
         uuid: profile.uuid,
         username: profile.name.clone(),
         entity_runtime_id: entity_id,
-        position: Vec3 {
-            y: movement.position.y - EYE_HEIGHT,
-            ..movement.position
-        },
+        position: movement.feet(),
         pitch: movement.pitch,
         yaw: movement.yaw,
         head_yaw: movement.head_yaw,
         game_mode: 1,
-        metadata: EntityMetadata(vec![
-            (metadata_key::FLAGS, MetadataValue::Long(0)),
-            (
-                metadata_key::NAME,
-                MetadataValue::String(profile.name.clone()),
-            ),
-            (metadata_key::SCALE, MetadataValue::Float(1.0)),
-            (metadata_key::WIDTH, MetadataValue::Float(0.6)),
-            (metadata_key::HEIGHT, MetadataValue::Float(1.8)),
-            (metadata_key::ALWAYS_SHOW_NAME_TAG, MetadataValue::Byte(1)),
-        ]),
+        metadata: player_metadata(&profile.name),
         entity_unique_id: unique_id(entity_id),
     }
 }
@@ -292,6 +374,29 @@ mod tests {
 
     use super::*;
 
+    const SPAWN_EYES: Vec3 = Vec3 {
+        x: 8.5,
+        y: -60.0 + EYE_HEIGHT,
+        z: 8.5,
+    };
+
+    fn standing_at(position: Vec3) -> Movement {
+        Movement {
+            position,
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            on_ground: true,
+        }
+    }
+
+    fn view_at(x: i32, z: i32) -> View {
+        View {
+            centre: ChunkPos::new(x, z),
+            radius: 8,
+        }
+    }
+
     fn joining(players: &Players, name: &str) -> (Joining, mpsc::Receiver<Bytes>) {
         let (outbound, queue) = mpsc::channel(16);
         let joining = Joining {
@@ -300,17 +405,8 @@ mod tests {
                 name: name.into(),
                 uuid: Uuid::new_v4(),
             },
-            movement: Movement {
-                position: Vec3 {
-                    x: 8.5,
-                    y: -60.0 + EYE_HEIGHT,
-                    z: 8.5,
-                },
-                pitch: 0.0,
-                yaw: 0.0,
-                head_yaw: 0.0,
-                on_ground: true,
-            },
+            movement: standing_at(SPAWN_EYES),
+            view: view_at(0, 0),
             outbound,
         };
         (joining, queue)
@@ -329,36 +425,31 @@ mod tests {
     }
 
     #[test]
-    fn players_see_each_other_join_move_and_leave() {
+    fn players_in_view_see_each_other_join_move_and_leave() {
         let players = Players::new();
         let (steve, mut steve_queue) = joining(&players, "Steve");
         let (alex, mut alex_queue) = joining(&players, "Alex");
-        assert_ne!(steve.entity_id, alex.entity_id);
 
         let steve = players.join(steve);
         assert!(ids(&mut steve_queue).is_empty(), "nobody else was online");
         let alex = players.join(alex);
-        assert_eq!(ids(&mut alex_queue), [id::PLAYER_LIST, id::ADD_PLAYER]);
-        assert_eq!(ids(&mut steve_queue), [id::PLAYER_LIST, id::ADD_PLAYER]);
+        assert_eq!(ids(&mut alex_queue), [id::PLAYER_LIST]);
+        assert_eq!(ids(&mut steve_queue), [id::PLAYER_LIST]);
 
-        // Nothing is sent until a player moves, and never to the mover.
-        players.broadcast_movement(1);
-        assert!(ids(&mut steve_queue).is_empty());
-        steve.moved(Movement {
-            position: Vec3 {
-                x: 9.0,
-                y: -58.38,
-                z: 8.5,
-            },
-            pitch: 5.0,
-            yaw: 90.0,
-            head_yaw: 80.0,
-            on_ground: true,
-        });
-        players.broadcast_movement(2);
+        // Entities appear on the next tick, carrying their position.
+        players.tick(1);
+        assert_eq!(ids(&mut alex_queue), [id::ADD_PLAYER]);
+        assert_eq!(ids(&mut steve_queue), [id::ADD_PLAYER]);
+
+        // Moves go to those who see the mover, never to the mover.
+        steve.moved(standing_at(Vec3 {
+            x: 9.0,
+            ..SPAWN_EYES
+        }));
+        players.tick(2);
         assert_eq!(ids(&mut alex_queue), [id::MOVE_PLAYER]);
         assert!(ids(&mut steve_queue).is_empty());
-        players.broadcast_movement(3);
+        players.tick(3);
         assert!(ids(&mut alex_queue).is_empty(), "each move is sent once");
 
         drop(steve);
@@ -366,6 +457,57 @@ mod tests {
         assert_eq!(players.count(), 1);
         drop(alex);
         assert_eq!(players.count(), 0);
+    }
+
+    #[test]
+    fn entities_follow_view_distance_both_ways() {
+        let players = Players::new();
+        let (steve, mut steve_queue) = joining(&players, "Steve");
+        let (alex, mut alex_queue) = joining(&players, "Alex");
+        let steve = players.join(steve);
+        let _alex = players.join(alex);
+        players.tick(1);
+        ids(&mut steve_queue);
+        ids(&mut alex_queue);
+
+        // Steve flies 20 chunks east, beyond Alex's radius of 8. His own view
+        // moves with him, so Alex leaves his view too.
+        let far = Vec3 {
+            x: 20.0 * 16.0 + 8.5,
+            ..SPAWN_EYES
+        };
+        steve.moved(standing_at(far));
+        steve.viewing(view_at(20, 0));
+        players.tick(2);
+        assert_eq!(ids(&mut alex_queue), [id::REMOVE_ACTOR]);
+        assert_eq!(ids(&mut steve_queue), [id::REMOVE_ACTOR]);
+
+        // Moving out there is not sent to Alex, who cannot see him.
+        steve.moved(standing_at(Vec3 { z: 20.0, ..far }));
+        players.tick(3);
+        assert!(ids(&mut alex_queue).is_empty());
+
+        // Flying back into Alex's view shows him again, although Alex never moved.
+        steve.moved(standing_at(SPAWN_EYES));
+        steve.viewing(view_at(0, 0));
+        players.tick(4);
+        assert_eq!(ids(&mut alex_queue), [id::ADD_PLAYER]);
+        assert_eq!(ids(&mut steve_queue), [id::ADD_PLAYER]);
+    }
+
+    #[test]
+    fn player_metadata_makes_the_client_apply_gravity() {
+        let metadata = player_metadata("Steve");
+        let flags = metadata
+            .0
+            .iter()
+            .find_map(|(key, value)| match (key, value) {
+                (&metadata_key::FLAGS, MetadataValue::Long(flags)) => Some(*flags),
+                _ => None,
+            })
+            .unwrap();
+        assert_ne!(flags & (1 << entity_flag::HAS_GRAVITY), 0);
+        assert_ne!(flags & (1 << entity_flag::HAS_COLLISION), 0);
     }
 
     #[test]

@@ -581,15 +581,28 @@ DTLS, SCTP, and multi-segment messages both ways.
 - **Visibility and movement (implemented):** `Players` keys players by entity ID and
   keeps each one's `Movement`: eye position, pitch, yaw, head yaw, and an on-ground guess
   (no vertical delta).
-  - Joining sends the newcomer a PlayerList entry and AddPlayer for everyone online, and
-    everyone else the same for the newcomer. The PlayerList goes first, so the client has
-    a skin for the entity.
-  - Each tick, every player who moved since the last tick is sent to all *other* players
-    as a MovePlayer (normal mode, eye position, the server tick). A player is never sent
-    their own movement.
-  - Leaving (the `Membership` drop) sends RemoveActor and a PlayerList removal.
-  - AddPlayer uses the feet position (eyes − 1.62), as Dragonfly does. Its metadata is
-    name, scale 1, a 0.6 × 1.8 bounding box, and an always-shown name tag (key 81).
+  - Joining puts everyone in everyone's player list at once, which also gives clients the
+    skins before any entity appears.
+  - **Entity tracker:** each player also has their client's `View` (centre chunk and
+    radius, reported by the session whenever it recentres) and the set of entities their
+    client has. Every tick, `Players::tick`:
+    - sends AddPlayer (with the current position) to each viewer whose view now contains
+      another player's chunk;
+    - sends RemoveActor to viewers whose view no longer does;
+    - then sends each player who moved since the last tick, as a MovePlayer (normal mode,
+      eye position, the server tick), only to viewers who already had them.
+    A player is never sent their own entity or movement. Either side moving updates
+    visibility: a player flying back towards someone standing still reappears for them.
+  - Leaving (the `Membership` drop) sends RemoveActor to those who saw the player, and a
+    PlayerList removal to everyone.
+  - AddPlayer uses the feet position (eyes − 1.62), as Dragonfly does. Its metadata,
+    `players::player_metadata`, is: name; scale 1; a 0.6 × 1.8 bounding box; an
+    always-shown name tag (key 81); and the flags HasGravity, HasCollision, Breathing,
+    CanClimb, ShowName and AlwaysShowName. Gophertunnel and PocketMine number these flags
+    the same way.
+  - The same metadata goes to each player about **their own** entity, as a SetActorData
+    just before PlayerSpawn. Without HasGravity the client does not pull its own player
+    down: the first live test showed players drifting upward after they stopped flying.
   - Skins are not forwarded yet: each player appears with a plain 64×64 classic skin,
     coloured from their UUID, on a humanoid geometry the skin defines itself.
 - **Chunk streaming (implemented):** each session keeps a `view::ChunkView`: the chunk
@@ -700,7 +713,8 @@ Each step starts only after explicit confirmation.
 | 5 | World spawning: StartGame, empty registries, hashed block IDs, flat chunks, PlayerSpawn → SetLocalPlayerAsInitialized | A live client leaves "Building terrain" and stands on grass | ✅ done 2026-09-25; a vanilla 1.26.51 client spawned on the grass at (8, -60, 8) (commit `98908a5`) |
 | 6 | Plugins meet the world: `player_join` event, Text packet and chat relay, Luau `server.on` / `server.broadcast`, welcome message in `hello.luau` | A live client sees the welcome message, and chat is echoed | ✅ done 2026-09-25; the yellow welcome appeared for a vanilla 1.26.51 client (commit `59e8247`) |
 | 7 | Tick loop and visibility: 20 TPS game loop, PlayerAuthInput decoding, per-player position, rotation and head yaw, PlayerList / AddPlayer / MovePlayer / RemoveActor between players | Two live clients see each other move | ✅ done 2026-09-26; two clients (PC and Android) saw each other move after the skin geometry fix |
-| 8 | Chunk streaming: track each player's chunk, recentre on crossing a boundary, send the chunks newly in range (radius ≤ 8) with a NetworkChunkPublisherUpdate; always-visible name tags | Walking or flying far keeps loading terrain | 🧪 ready for a live test (2026-09-26) |
+| 8 | Chunk streaming: track each player's chunk, recentre on crossing a boundary, send the chunks newly in range (radius ≤ 8) with a NetworkChunkPublisherUpdate; always-visible name tags | Walking or flying far keeps loading terrain | ✅ done 2026-09-26; streaming worked live (commit `5064e11`) |
+| 9 | Entity tracker (AddPlayer and RemoveActor as players enter and leave each other's view), and own-entity metadata with HasGravity so players stop floating | A player returning to a stationary one reappears; players fall after flying | 🧪 ready for a live test (2026-09-26) |
 
 Later steps are proposed but not yet scheduled:
 - player auth (JWKS verification of the multiplayer token)
