@@ -3,3 +3,6 @@
 # Server identity private key (auto-generated on first run) — never commit.
 /keys/
 *.pem
+
+# Personal notes, not part of the project.
+/roadmap.txt

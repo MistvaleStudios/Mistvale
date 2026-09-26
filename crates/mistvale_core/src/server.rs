@@ -1,6 +1,7 @@
 //! State every session shares, and what plugins ask of it.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mistvale_plugins::{Action, Dispatcher};
 use tokio::sync::mpsc;
@@ -16,6 +17,8 @@ pub struct Server {
     pub world: Arc<FlatWorld>,
     pub players: Players,
     pub plugins: Dispatcher,
+    /// The last tick the game loop ran; 0 before the first.
+    tick: AtomicU64,
 }
 
 impl Server {
@@ -24,7 +27,18 @@ impl Server {
             world: Arc::new(world),
             players: Players::new(),
             plugins,
+            tick: AtomicU64::new(0),
         }
+    }
+
+    pub fn current_tick(&self) -> u64 {
+        self.tick.load(Ordering::Relaxed)
+    }
+
+    /// Advances the world by one tick; called by the game loop.
+    pub fn tick(&self, tick: u64) {
+        self.tick.store(tick, Ordering::Relaxed);
+        self.players.broadcast_movement(tick);
     }
 
     /// Carries out one plugin action.

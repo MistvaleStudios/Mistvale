@@ -12,7 +12,11 @@ pub mod id {
     pub const RESOURCE_PACK_CLIENT_RESPONSE: u32 = 8;
     pub const TEXT: u32 = 9;
     pub const START_GAME: u32 = 11;
+    pub const ADD_PLAYER: u32 = 12;
+    pub const REMOVE_ACTOR: u32 = 14;
+    pub const MOVE_PLAYER: u32 = 19;
     pub const LEVEL_CHUNK: u32 = 58;
+    pub const PLAYER_LIST: u32 = 63;
     pub const REQUEST_CHUNK_RADIUS: u32 = 69;
     pub const CHUNK_RADIUS_UPDATED: u32 = 70;
     pub const SET_LOCAL_PLAYER_AS_INITIALIZED: u32 = 113;

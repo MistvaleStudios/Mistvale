@@ -85,6 +85,13 @@ pub struct Dispatcher {
 }
 
 impl Dispatcher {
+    /// A dispatcher with no plugins behind it, which drops every event; for
+    /// running without a plugin host, e.g. in tests.
+    pub fn disconnected() -> Self {
+        let (commands, _) = mpsc::channel();
+        Self { commands }
+    }
+
     /// Queues `event` for every plugin listening for it.
     pub fn dispatch(&self, event: Event) {
         let _ = self.commands.send(Command::Event(event));

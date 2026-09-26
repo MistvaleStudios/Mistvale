@@ -15,6 +15,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use mistvale_core::server::{self, PLUGIN_ACTION_QUEUE, Server};
 use mistvale_core::session;
+use mistvale_core::tick::TickLoop;
 use mistvale_core::world::FlatWorld;
 use mistvale_net::{Connection, Listener, ListenerConfig, ServerStatus};
 use mistvale_plugins::{PluginConfig, PluginHost};
@@ -46,6 +47,9 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&server),
         plugin_actions,
     ));
+    // Stops when dropped, as `main` returns.
+    let _game_loop =
+        TickLoop::start(Arc::clone(&server)).context("failed to start the game loop")?;
 
     let status = ServerStatus {
         name: "Mistvale BDS".into(),

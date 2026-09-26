@@ -521,14 +521,27 @@ DTLS, SCTP, and multi-segment messages both ways.
   | `packets::spawn` | StartGame and the §3.5.1 packets |
   | `packets::text` | Text (ID 9): `[bool translate][varuint32 body variant][u8 type]`, then author (chat, whisper, announcement), message (1..=65536 bytes), parameters (translate, popups; ≤ 4), XUID, platform chat ID, optional filtered message. The variant must match the type. |
 
-  43 unit tests. They include a golden decode of a real client's first message, and FNV-1a
+  | `packets::movement` | PlayerAuthInput, decoded up to the position delta, with the rest skipped; input flags kept as raw IDs, since Mojang's enum and gophertunnel's number them differently. MovePlayer, without teleports. |
+  | `packets::entity` | AddPlayer, RemoveActor, PlayerList (a per-entry varuint32 variant plus an action byte), entity metadata, and a classic `Skin` |
+  | `types` (additions) | `Vec2`, and `uuid_bytes`: Bedrock's UUID order, two little-endian u64 halves |
+
+  51 unit tests. They include a golden decode of a real client's first message, and FNV-1a
   checked against the reference vectors plus golden hash-input bytes. NBT decoding is not
   started yet.
 
 ### 4.5 `mistvale_core`
 
-- **Game loop:** a dedicated OS thread with a fixed 50 ms step, not a tokio task, to avoid
-  scheduler jitter. The tokio runtime owns I/O, and bounded channels connect the two.
+- **Game loop (first cut implemented):** `tick::TickLoop` runs `Server::tick` on a
+  dedicated OS thread (`game-loop`) with a fixed 50 ms step, not a tokio task, to avoid
+  scheduler jitter. The tokio runtime owns I/O.
+  - Ticks follow a schedule rather than sleeping 50 ms after each one, so a slow tick is
+    made up by quicker ones.
+  - A tick over 50 ms logs a warning. More than 1 s behind, the loop skips the missed
+    ticks instead of racing to catch up.
+  - Dropping the `TickLoop` stops it after the current tick.
+  - So far a tick only broadcasts movement. Sessions still write player state into
+    `Players` behind a mutex rather than through channels; that changes once the
+    simulation owns real state.
 - **Tick phases:** drain inbound → simulate → dispatch plugin events → flush one batch per
   player. This gives natural batching and better compression.
 - **World:** a single owner, as in Dragonfly, with a chunk map per dimension.
@@ -548,8 +561,11 @@ DTLS, SCTP, and multi-segment messages both ways.
     message**, so the client shows a reason instead of timing out.
   - Once in the world, packets without a handler are ignored.
   - After a Disconnect it waits up to 5 s for the client to hang up.
-  - Replies also carry `SessionEvent`s for the rest of the server: `Joined(Profile)` on
-    the first SetLocalPlayerAsInitialized, and `Chat(message)`.
+  - Replies also carry `SessionEvent`s for the rest of the server: `Joined` on the first
+    SetLocalPlayerAsInitialized, `Moved` when PlayerAuthInput reports a new position or
+    rotation (in game only; non-finite values are ignored), and `Chat(message)`.
+  - Each session gets its own entity ID from `Players::allocate_entity_id` (runtime ID =
+    unique ID), used in its StartGame and by everyone who sees the player.
 - **Players and chat (implemented):** `server::Server` holds the world, the
   `players::Players` registry and the plugin `Dispatcher`. Each session has a bounded
   queue (256 packets) that `run` drains alongside the connection, batching whatever is
@@ -562,12 +578,37 @@ DTLS, SCTP, and multi-segment messages both ways.
     refused with a warning to the sender. Everything else goes to everyone as Raw text
     `<name> message`, as Dragonfly does, so no player list is needed.
   - A full player queue drops that player's packet rather than stalling the others.
+- **Visibility and movement (implemented):** `Players` keys players by entity ID and
+  keeps each one's `Movement`: eye position, pitch, yaw, head yaw, and an on-ground guess
+  (no vertical delta).
+  - Joining sends the newcomer a PlayerList entry and AddPlayer for everyone online, and
+    everyone else the same for the newcomer. The PlayerList goes first, so the client has
+    a skin for the entity.
+  - Each tick, every player who moved since the last tick is sent to all *other* players
+    as a MovePlayer (normal mode, eye position, the server tick). A player is never sent
+    their own movement.
+  - Leaving (the `Membership` drop) sends RemoveActor and a PlayerList removal.
+  - AddPlayer uses the feet position (eyes − 1.62), as Dragonfly does. Its metadata is
+    name, scale 1, a 0.6 × 1.8 bounding box, and an always-shown name tag (key 81).
+  - Skins are not forwarded yet: each player appears with a plain 64×64 classic skin,
+    coloured from their UUID, on a humanoid geometry the skin defines itself.
+- **Chunk streaming (implemented):** each session keeps a `view::ChunkView`: the chunk
+  its player stands in, the granted radius (capped at 8), and the chunks its client has.
+  - A RequestChunkRadius, or PlayerAuthInput crossing into another chunk (the feet's
+    block, divided by 16 and rounded down), recentres the view. The session then sends a
+    NetworkChunkPublisherUpdate at the player's block with radius × 16 blocks, followed
+    by every chunk in the new circle the client lacks, nearest first.
+  - Chunks that fall out of range are forgotten, because the client unloads them, so
+    they are sent again on return. A one-chunk step sends only the circle's leading
+    edge (about 17 chunks at radius 8).
+  - Streaming happens in the session as input arrives, not in the tick loop. Chunks
+    come from `FlatWorld`, so no generation cost is involved yet.
 - **World (first cut):** `world::FlatWorld` is an endless superflat overworld. It has
   vanilla's default layers (bedrock at y = -64, two dirt, grass at -61) in plains. Every
   chunk is identical, so the encoded payload is built once and cloned per LevelChunk. The
   spawn is (8, -60, 8).
 
-  The tick loop, real chunk storage, generation and entities are not started yet.
+  Real chunk storage, generation and entities are not started yet.
 
 ### 4.6 `mistvale_plugins`
 
@@ -657,12 +698,15 @@ Each step starts only after explicit confirmation.
 | 3 | `mistvale_plugins` Luau bridge: load `plugins/*.luau` into a sandbox and route `print` to the log | The `plugins/hello.luau` smoke test works | ✅ done 2026-09-25 (prints on boot; hot reload verified live) |
 | 4 | Protocol handshake: batch codec, NetworkSettings → Login → resource packs; ICE-lite so sends only use paths the client proved | A live client gets past RequestNetworkSettings and receives Mistvale's disconnect message | ✅ done 2026-09-25; a vanilla 1.26.51 client over ICE-lite showed the disconnect message (commit `5aab46c`) |
 | 5 | World spawning: StartGame, empty registries, hashed block IDs, flat chunks, PlayerSpawn → SetLocalPlayerAsInitialized | A live client leaves "Building terrain" and stands on grass | ✅ done 2026-09-25; a vanilla 1.26.51 client spawned on the grass at (8, -60, 8) (commit `98908a5`) |
-| 6 | Plugins meet the world: `player_join` event, Text packet and chat relay, Luau `server.on` / `server.broadcast`, welcome message in `hello.luau` | A live client sees the welcome message, and chat is echoed | 🧪 ready for a live test (2026-09-25) |
+| 6 | Plugins meet the world: `player_join` event, Text packet and chat relay, Luau `server.on` / `server.broadcast`, welcome message in `hello.luau` | A live client sees the welcome message, and chat is echoed | ✅ done 2026-09-25; the yellow welcome appeared for a vanilla 1.26.51 client (commit `59e8247`) |
+| 7 | Tick loop and visibility: 20 TPS game loop, PlayerAuthInput decoding, per-player position, rotation and head yaw, PlayerList / AddPlayer / MovePlayer / RemoveActor between players | Two live clients see each other move | ✅ done 2026-09-26; two clients (PC and Android) saw each other move after the skin geometry fix |
+| 8 | Chunk streaming: track each player's chunk, recentre on crossing a boundary, send the chunks newly in range (radius ≤ 8) with a NetworkChunkPublisherUpdate; always-visible name tags | Walking or flying far keeps loading terrain | 🧪 ready for a live test (2026-09-26) |
 
 Later steps are proposed but not yet scheduled:
 - player auth (JWKS verification of the multiplayer token)
 - vanilla item and biome data (ItemRegistry, BiomeDefinitionList, CreativeContent)
-- the core tick loop and world
+- real skins forwarded from each client's login data (persona pieces and tints included)
+- movement validation (speed and teleport checks) and server corrections
 - chunk streaming
 - more plugin events (chat, quit) and actions
 - the JS/TS and Python engines
@@ -685,6 +729,14 @@ Later steps are proposed but not yet scheduled:
   `network-id`, while libwebrtc (and so our answer) writes it before. It then silently
   drops the candidate. This only affects str0m acting as a client, as in the loopback
   test, which normalizes the lines.
+- **Visibility works live after a skin fix.** The first two-client test (2026-09-26)
+  disconnected both clients the moment the second one joined. The generated skin had an
+  empty geometry string, which Mojang's schema says must be valid JSON. The skin now
+  carries a full `geometry.humanoid.custom` definition (format 1.12.0, engine version
+  `0.0.0`), the way vanilla clients send classic skins. AddPlayer and its ability layer
+  were re-checked against Mojang's schema and match, and the retest succeeded. Movement is
+  still trusted as the client reports it. Sneaking and arm swings are not shown yet: they
+  depend on input flag IDs, which Mojang's schema and gophertunnel number differently.
 - **Players are not authenticated yet.** We verify that the offer's `cpk` key signed its
   DTLS fingerprints, which binds the session to that key. We do not yet verify the
   GameServerToken's RS256 signature against the Minecraft auth service JWKS, so the

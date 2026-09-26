@@ -10,6 +10,8 @@ use std::time::Duration;
 pub mod players;
 pub mod server;
 pub mod session;
+pub mod tick;
+pub mod view;
 pub mod world;
 
 /// Simulation rate of the game loop.

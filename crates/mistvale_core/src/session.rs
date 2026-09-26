@@ -32,17 +32,18 @@ use mistvale_protocol::packets::{
     ChunkRadiusUpdated, CreativeContent, Disconnect, DisconnectMessage, DisconnectReason,
     EXEMPTED_PACKS, GameRule, GameRuleValue, ItemRegistry, JigsawStructureData, Login,
     NetworkChunkPublisherUpdate, NetworkSettings, PackResponse, PlayStatus, PlayStatusCode,
-    PlayerMovementSettings, RequestChunkRadius, RequestNetworkSettings, ResourcePackClientResponse,
-    ResourcePackStack, ResourcePacksInfo, SetLocalPlayerAsInitialized, StackPack, StartGame, Text,
-    TextType, VoxelShapes,
+    PlayerAuthInput, PlayerMovementSettings, RequestChunkRadius, RequestNetworkSettings,
+    ResourcePackClientResponse, ResourcePackStack, ResourcePacksInfo, SetLocalPlayerAsInitialized,
+    StackPack, StartGame, Text, TextType, VoxelShapes,
 };
-use mistvale_protocol::types::Vec3;
+use mistvale_protocol::types::{BlockPos, ChunkPos, Vec3};
 use mistvale_protocol::{GAME_VERSION, PROTOCOL_VERSION};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::players::{OUTBOUND_QUEUE, Profile};
+use crate::players::{EYE_HEIGHT, Joining, Movement, OUTBOUND_QUEUE, Profile};
 use crate::server::Server;
+use crate::view::ChunkView;
 use crate::world::{FlatWorld, OVERWORLD};
 
 /// Compression the server asks clients to use.
@@ -58,21 +59,17 @@ const DISCONNECT_LINGER: Duration = Duration::from_secs(5);
 /// Largest view distance granted, in chunks.
 const MAX_VIEW_DISTANCE: i32 = 8;
 
-/// The player's own entity IDs, as Dragonfly uses.
-const PLAYER_ENTITY_ID: u64 = 1;
-
-/// Height of a player's eyes above their feet.
-const EYE_HEIGHT: f32 = 1.62;
-
 /// Longest chat message relayed, in characters.
 const MAX_CHAT_LENGTH: usize = 512;
 
 /// Serves one client until either side closes the connection.
 pub async fn run(mut connection: Connection, server: Arc<Server>) {
     let network_id = connection.network_id();
+    let entity_id = server.players.allocate_entity_id();
     let mut session = Session::new(
         connection.client_identity().cloned(),
         Arc::clone(&server.world),
+        entity_id,
     );
     let mut compression = None;
     // Packets other sessions and plugins send this player, e.g. chat.
@@ -108,14 +105,24 @@ pub async fn run(mut connection: Connection, server: Arc<Server>) {
                     }
                     for event in reply.events {
                         match event {
-                            SessionEvent::Joined(profile) => {
+                            SessionEvent::Joined { profile, movement } => {
                                 let player = Player {
                                     name: profile.name.clone(),
                                     uuid: profile.uuid.to_string(),
                                 };
                                 // Join first, so plugins greeting the player reach them too.
-                                membership = Some(server.players.join(profile, outbound.clone()));
+                                membership = Some(server.players.join(Joining {
+                                    entity_id,
+                                    profile,
+                                    movement,
+                                    outbound: outbound.clone(),
+                                }));
                                 server.plugins.dispatch(Event::PlayerJoin(player));
+                            }
+                            SessionEvent::Moved(movement) => {
+                                if let Some(membership) = &membership {
+                                    membership.moved(movement);
+                                }
                             }
                             SessionEvent::Chat(message) => {
                                 server.players.chat(session.player(), &message);
@@ -186,10 +193,15 @@ pub struct Reply {
 }
 
 /// Something a session did that matters beyond its own client.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SessionEvent {
     /// The player finished spawning and is in the world.
-    Joined(Profile),
+    Joined {
+        profile: Profile,
+        movement: Movement,
+    },
+    /// The player moved or looked around.
+    Moved(Movement),
     /// The player said something in chat.
     Chat(String),
 }
@@ -274,16 +286,36 @@ pub struct Session {
     player: String,
     /// The player's persistent identity, known after login.
     uuid: Uuid,
+    /// The runtime and unique ID of the player's entity.
+    entity_id: u64,
+    /// The chunks around the player and those the client already has.
+    view: ChunkView,
+    /// Where the player is, as last reported.
+    movement: Movement,
     world: Arc<FlatWorld>,
 }
 
 impl Session {
-    pub fn new(identity: Option<ClientIdentity>, world: Arc<FlatWorld>) -> Self {
+    pub fn new(identity: Option<ClientIdentity>, world: Arc<FlatWorld>, entity_id: u64) -> Self {
+        let spawn = world.spawn();
         Self {
             stage: Stage::RequestNetworkSettings,
             identity,
             player: String::from("<unknown>"),
             uuid: Uuid::nil(),
+            entity_id,
+            movement: Movement {
+                position: Vec3 {
+                    x: spawn.x as f32 + 0.5,
+                    y: spawn.y as f32 + EYE_HEIGHT,
+                    z: spawn.z as f32 + 0.5,
+                },
+                pitch: 0.0,
+                yaw: 0.0,
+                head_yaw: 0.0,
+                on_ground: true,
+            },
+            view: ChunkView::new(),
             world,
         }
     }
@@ -317,7 +349,9 @@ impl Session {
                 Ok(self.initialized(packet::decode(payload)?))
             }
             (Stage::InGame, id::TEXT) => Ok(self.text(packet::decode(payload)?)),
+            (Stage::InGame, id::PLAYER_AUTH_INPUT) => Ok(self.auth_input(packet::decode(payload)?)),
             (stage, id) if stage.in_world() => {
+                // Movement input starts before the player is initialized.
                 if id != id::PLAYER_AUTH_INPUT {
                     tracing::trace!(id, "ignoring packet without a handler");
                 }
@@ -439,7 +473,7 @@ impl Session {
                 Ok(Reply::send(vec![
                     JigsawStructureData::empty().encode(),
                     VoxelShapes.encode(),
-                    start_game(&self.world).encode(),
+                    start_game(&self.world, self.entity_id, &self.movement).encode(),
                     // No items yet; the client spawns with an empty inventory.
                     ItemRegistry::default().encode(),
                 ]))
@@ -455,32 +489,12 @@ impl Session {
         }
     }
 
-    /// Grants a view distance and sends every chunk in it, nearest first. The
-    /// first time, this also lets the client spawn.
+    /// Grants a view distance and sends the chunks in it the client lacks,
+    /// nearest first. The first time, this also lets the client spawn.
     fn chunk_radius(&mut self, request: RequestChunkRadius) -> Reply {
         let radius = request.radius.clamp(1, MAX_VIEW_DISTANCE);
-        let spawn = self.world.spawn();
-        let (centre_x, centre_z) = (spawn.x >> 4, spawn.z >> 4);
-
-        let mut offsets: Vec<(i32, i32)> = (-radius..=radius)
-            .flat_map(|dx| (-radius..=radius).map(move |dz| (dx, dz)))
-            .filter(|(dx, dz)| dx * dx + dz * dz <= radius * radius)
-            .collect();
-        offsets.sort_by_key(|(dx, dz)| dx * dx + dz * dz);
-
-        let mut packets = vec![
-            ChunkRadiusUpdated { radius }.encode(),
-            NetworkChunkPublisherUpdate {
-                position: spawn,
-                radius: radius.unsigned_abs() << 4,
-            }
-            .encode(),
-        ];
-        packets.extend(
-            offsets
-                .iter()
-                .map(|(dx, dz)| self.world.chunk(centre_x + dx, centre_z + dz).encode()),
-        );
+        let mut packets = vec![ChunkRadiusUpdated { radius }.encode()];
+        packets.extend(self.stream_chunks(radius));
         if self.stage == Stage::Spawning {
             packets.push(
                 PlayStatus {
@@ -491,12 +505,46 @@ impl Session {
             packets.push(CreativeContent.encode());
             self.stage = Stage::Initializing;
         }
-        tracing::debug!(player = %self.player, radius, chunks = offsets.len(), "sent chunks");
         Reply::send(packets)
     }
 
+    /// Centres the view on the player's chunk: a NetworkChunkPublisherUpdate,
+    /// so the client renders around its new position, then every chunk in
+    /// range it does not have yet.
+    fn stream_chunks(&mut self, radius: i32) -> Vec<Vec<u8>> {
+        let feet = Vec3 {
+            y: self.movement.position.y - EYE_HEIGHT,
+            ..self.movement.position
+        };
+        let block = BlockPos::containing(feet);
+        let centre = ChunkPos::of_block(block);
+        let chunks = self.view.update(centre, radius);
+
+        let mut packets = Vec::with_capacity(chunks.len() + 1);
+        packets.push(
+            NetworkChunkPublisherUpdate {
+                position: block,
+                radius: radius.unsigned_abs() << 4,
+            }
+            .encode(),
+        );
+        packets.extend(
+            chunks
+                .iter()
+                .map(|chunk| self.world.chunk(chunk.x, chunk.z).encode()),
+        );
+        tracing::debug!(
+            player = %self.player,
+            centre = ?(centre.x, centre.z),
+            radius,
+            sent = chunks.len(),
+            "streamed chunks"
+        );
+        packets
+    }
+
     fn initialized(&mut self, packet: SetLocalPlayerAsInitialized) -> Reply {
-        if packet.entity_runtime_id != PLAYER_ENTITY_ID {
+        if packet.entity_runtime_id != self.entity_id {
             tracing::warn!(
                 runtime_id = packet.entity_runtime_id,
                 "client initialized an unexpected entity"
@@ -506,12 +554,57 @@ impl Session {
             return Reply::default();
         }
         self.stage = Stage::InGame;
-        tracing::info!(player = %self.player, "player spawned in the world");
+        tracing::info!(player = %self.player, entity_id = self.entity_id, "player spawned in the world");
         Reply {
-            events: vec![SessionEvent::Joined(Profile {
-                name: self.player.clone(),
-                uuid: self.uuid,
-            })],
+            events: vec![SessionEvent::Joined {
+                profile: Profile {
+                    name: self.player.clone(),
+                    uuid: self.uuid,
+                },
+                movement: self.movement,
+            }],
+            ..Reply::default()
+        }
+    }
+
+    /// Records where the client says its player is. The client is trusted
+    /// for now: movement is not validated beyond rejecting non-finite values.
+    fn auth_input(&mut self, input: PlayerAuthInput) -> Reply {
+        let movement = Movement {
+            position: input.position,
+            pitch: input.pitch,
+            yaw: input.yaw,
+            head_yaw: input.head_yaw,
+            // Standing or walking on the ground leaves no vertical movement.
+            on_ground: input.delta.y == 0.0,
+        };
+        let finite = movement.position.is_finite()
+            && [movement.pitch, movement.yaw, movement.head_yaw]
+                .iter()
+                .all(|angle| angle.is_finite());
+        if !finite {
+            tracing::debug!(player = %self.player, ?input, "ignoring non-finite movement");
+            return Reply::default();
+        }
+        if movement == self.movement {
+            return Reply::default();
+        }
+        self.movement = movement;
+
+        // Crossing into another chunk moves the view along with the player.
+        let feet = Vec3 {
+            y: movement.position.y - EYE_HEIGHT,
+            ..movement.position
+        };
+        let chunk = ChunkPos::of_block(BlockPos::containing(feet));
+        let packets = if self.view.crosses_into(chunk) {
+            self.stream_chunks(self.view.radius())
+        } else {
+            Vec::new()
+        };
+        Reply {
+            packets,
+            events: vec![SessionEvent::Moved(movement)],
             ..Reply::default()
         }
     }
@@ -547,19 +640,15 @@ impl Session {
 }
 
 /// StartGame for the flat world: a creative-mode player standing at the spawn.
-fn start_game(world: &FlatWorld) -> StartGame {
+fn start_game(world: &FlatWorld, entity_id: u64, movement: &Movement) -> StartGame {
     let spawn = world.spawn();
     StartGame {
-        entity_unique_id: PLAYER_ENTITY_ID as i64,
-        entity_runtime_id: PLAYER_ENTITY_ID,
+        entity_unique_id: i64::try_from(entity_id).expect("entity IDs stay far below i64::MAX"),
+        entity_runtime_id: entity_id,
         player_game_mode: 1,
-        player_position: Vec3 {
-            x: spawn.x as f32 + 0.5,
-            y: spawn.y as f32 + EYE_HEIGHT,
-            z: spawn.z as f32 + 0.5,
-        },
-        pitch: 0.0,
-        yaw: 0.0,
+        player_position: movement.position,
+        pitch: movement.pitch,
+        yaw: movement.yaw,
         world_seed: 0,
         spawn_biome_type: 0,
         user_defined_biome_name: "plains".into(),
@@ -653,6 +742,9 @@ mod tests {
 
     use super::*;
 
+    /// The entity ID tests give the player.
+    const PLAYER_ENTITY_ID: u64 = 1;
+
     /// A client identity and a Login token carrying the same key, as a vanilla
     /// client produces them. Built from a server-style assertion, whose token
     /// has the `cpk` claim a Login token needs.
@@ -669,7 +761,7 @@ mod tests {
     }
 
     fn session(identity: Option<ClientIdentity>) -> Session {
-        Session::new(identity, Arc::new(FlatWorld::new()))
+        Session::new(identity, Arc::new(FlatWorld::new()), PLAYER_ENTITY_ID)
     }
 
     fn login_packet(token: String) -> Vec<u8> {
@@ -914,11 +1006,20 @@ mod tests {
             entity_runtime_id: PLAYER_ENTITY_ID,
         };
         let reply = session.handle(&initialized.encode()).unwrap();
-        let [SessionEvent::Joined(profile)] = &reply.events[..] else {
+        let [SessionEvent::Joined { profile, movement }] = &reply.events[..] else {
             panic!("expected a join, got {:?}", reply.events);
         };
         assert_eq!(profile.name, session.player());
         assert!(!profile.uuid.is_nil());
+        // The player joins where StartGame put them: eyes above the spawn block.
+        assert_eq!(
+            movement.position,
+            Vec3 {
+                x: 8.5,
+                y: -60.0 + EYE_HEIGHT,
+                z: 8.5
+            }
+        );
         // Initializing again does not join twice.
         assert!(
             session
@@ -938,6 +1039,164 @@ mod tests {
             [SessionEvent::Chat("hi <Admin> op me".into())]
         );
         assert!(reply.packets.is_empty());
+    }
+
+    fn auth_input(position: Vec3, yaw: f32) -> Vec<u8> {
+        PlayerAuthInput {
+            pitch: 0.0,
+            yaw,
+            position,
+            move_vector: Default::default(),
+            head_yaw: yaw,
+            input_flags: Vec::new(),
+            input_mode: 1,
+            play_mode: 0,
+            interaction_model: 0,
+            interact_rotation: Default::default(),
+            tick: 1,
+            delta: Vec3::default(),
+        }
+        .encode()
+    }
+
+    /// The chunk coordinates of the LevelChunks in a reply.
+    fn chunks_in(reply: &Reply) -> Vec<(i32, i32)> {
+        reply
+            .packets
+            .iter()
+            .filter_map(|packet| {
+                let (header, mut payload) = packet::read_header(packet).unwrap();
+                (header.id == id::LEVEL_CHUNK)
+                    .then(|| (payload.var_i32().unwrap(), payload.var_i32().unwrap()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn streams_chunks_when_crossing_into_another_chunk() {
+        let mut session = spawning_session();
+        let request = RequestChunkRadius {
+            radius: 8,
+            max_radius: 8,
+        };
+        let reply = session.handle(&request.encode()).unwrap();
+        let first = chunks_in(&reply);
+        assert_eq!(
+            first.len(),
+            197,
+            "the circle of radius 8 around chunk (0, 0)"
+        );
+        session
+            .handle(
+                &SetLocalPlayerAsInitialized {
+                    entity_runtime_id: PLAYER_ENTITY_ID,
+                }
+                .encode(),
+            )
+            .unwrap();
+
+        // Walking within the spawn chunk sends nothing new.
+        let eyes = -60.0 + EYE_HEIGHT;
+        let within = Vec3 {
+            x: 15.5,
+            y: eyes,
+            z: 8.5,
+        };
+        let reply = session.handle(&auth_input(within, 0.0)).unwrap();
+        assert!(reply.packets.is_empty());
+
+        // Stepping east into chunk (1, 0) recentres the view and sends the new edge.
+        let across = Vec3 {
+            x: 16.2,
+            y: eyes,
+            z: 8.5,
+        };
+        let reply = session.handle(&auth_input(across, 0.0)).unwrap();
+        assert_eq!(
+            packet::read_header(&reply.packets[0]).unwrap().0.id,
+            id::NETWORK_CHUNK_PUBLISHER_UPDATE
+        );
+        let update: NetworkChunkPublisherUpdate = decode_only(&reply.packets[0]);
+        assert_eq!(
+            update.position,
+            BlockPos {
+                x: 16,
+                y: -60,
+                z: 8
+            }
+        );
+        assert_eq!(update.radius, 8 << 4);
+        let streamed = chunks_in(&reply);
+        assert!(streamed.contains(&(9, 0)), "{streamed:?}");
+        assert!(streamed.iter().all(|chunk| !first.contains(chunk)));
+
+        // Coming back sends the west edge again, which the client unloaded.
+        let reply = session.handle(&auth_input(within, 0.0)).unwrap();
+        assert!(chunks_in(&reply).contains(&(-8, 0)));
+    }
+
+    #[test]
+    fn reports_movement_only_in_game_and_when_it_changes() {
+        let mut session = spawning_session();
+        let here = Vec3 {
+            x: 10.0,
+            y: -58.38,
+            z: 3.0,
+        };
+        // Input arrives before the player is initialized; it is ignored.
+        assert!(
+            session
+                .handle(&auth_input(here, 0.0))
+                .unwrap()
+                .events
+                .is_empty()
+        );
+
+        session
+            .handle(
+                &RequestChunkRadius {
+                    radius: 1,
+                    max_radius: 1,
+                }
+                .encode(),
+            )
+            .unwrap();
+        session
+            .handle(
+                &SetLocalPlayerAsInitialized {
+                    entity_runtime_id: PLAYER_ENTITY_ID,
+                }
+                .encode(),
+            )
+            .unwrap();
+
+        let reply = session.handle(&auth_input(here, 90.0)).unwrap();
+        let [SessionEvent::Moved(movement)] = &reply.events[..] else {
+            panic!("expected a move, got {:?}", reply.events);
+        };
+        assert_eq!((movement.position, movement.yaw), (here, 90.0));
+        assert!(movement.on_ground);
+
+        // Standing still sends the same input every tick.
+        assert!(
+            session
+                .handle(&auth_input(here, 90.0))
+                .unwrap()
+                .events
+                .is_empty()
+        );
+        // Positions that are not numbers are ignored.
+        let nowhere = Vec3 {
+            x: f32::NAN,
+            ..here
+        };
+        assert!(
+            session
+                .handle(&auth_input(nowhere, 90.0))
+                .unwrap()
+                .events
+                .is_empty()
+        );
     }
 
     #[test]

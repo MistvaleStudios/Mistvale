@@ -420,6 +420,21 @@ impl Encode for NetworkChunkPublisherUpdate {
     }
 }
 
+impl Decode for NetworkChunkPublisherUpdate {
+    fn decode_payload(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        let update = Self {
+            position: BlockPos::read(reader)?,
+            radius: reader.var_u32()?,
+        };
+        // Saved chunks: a count, then that many chunk positions (two varints each).
+        for _ in 0..reader.u32_le()? {
+            reader.var_i32()?;
+            reader.var_i32()?;
+        }
+        Ok(update)
+    }
+}
+
 /// One chunk column, sent in full without the blob cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LevelChunk {
