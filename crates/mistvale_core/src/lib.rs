@@ -11,6 +11,7 @@ pub mod auth;
 pub mod config;
 pub mod console;
 pub mod inventory;
+pub mod items;
 pub mod logins;
 pub mod players;
 pub mod server;

@@ -4,6 +4,7 @@ use crate::io::{DecodeError, Reader, Writer};
 use crate::packet::{Decode, Encode, Packet, id};
 use crate::packets::BlockAction;
 use crate::packets::inventory::skip_embedded_use_item;
+use crate::packets::item_stack::StackRequest;
 use crate::types::{Vec2, Vec3};
 
 /// PlayerAuthInput input flag IDs, as gophertunnel numbers them; Mojang's
@@ -49,8 +50,12 @@ pub struct PlayerAuthInput {
     pub delta: Vec3,
     /// Block breaking progress this tick, with server-authoritative breaking.
     pub block_actions: Vec<BlockAction>,
-    /// An item stack request hid this tick's block actions; see above.
+    /// The tail after the movement could not be read, so any block actions
+    /// and item stack request this tick are lost.
     pub block_actions_unread: bool,
+    /// An item stack request sent along with the input, such as a tool's
+    /// predicted durability while mining; it needs a response like any other.
+    pub item_stack_request: Option<StackRequest>,
 }
 
 impl Packet for PlayerAuthInput {
@@ -89,29 +94,37 @@ impl Decode for PlayerAuthInput {
             delta: Vec3::read(reader)?,
             block_actions: Vec::new(),
             block_actions_unread: false,
+            item_stack_request: None,
         };
         // The rest is optional. Reading it must never cost the movement above,
         // so a tail that cannot be parsed only leaves the block actions unread.
-        match read_block_actions(&mut reader.clone()) {
-            Ok(Some(actions)) => input.block_actions = actions,
-            Ok(None) | Err(_) => input.block_actions_unread = true,
+        match read_tail(&mut reader.clone()) {
+            Ok((actions, request)) => {
+                input.block_actions = actions;
+                input.item_stack_request = request;
+            }
+            Err(_) => input.block_actions_unread = true,
         }
         reader.take(reader.remaining())?;
         Ok(input)
     }
 }
 
-/// Reads past the item interaction to the block actions. `None` when an item
-/// stack request stands in the way.
-fn read_block_actions(reader: &mut Reader<'_>) -> Result<Option<Vec<BlockAction>>, DecodeError> {
+/// Reads past the item interaction to the item stack request and the block
+/// actions.
+fn read_tail(
+    reader: &mut Reader<'_>,
+) -> Result<(Vec<BlockAction>, Option<StackRequest>), DecodeError> {
     if reader.bool()? {
         skip_embedded_use_item(reader)?;
     }
-    if reader.bool()? {
-        return Ok(None);
-    }
+    let request = if reader.bool()? {
+        Some(StackRequest::read(reader)?)
+    } else {
+        None
+    };
     if !reader.bool()? {
-        return Ok(Some(Vec::new()));
+        return Ok((Vec::new(), request));
     }
     let count = reader.var_u32()?;
     if count > MAX_BLOCK_ACTIONS {
@@ -120,10 +133,10 @@ fn read_block_actions(reader: &mut Reader<'_>) -> Result<Option<Vec<BlockAction>
             value: count.into(),
         });
     }
-    (0..count)
+    let actions = (0..count)
         .map(|_| BlockAction::read(reader))
-        .collect::<Result<_, _>>()
-        .map(Some)
+        .collect::<Result<_, _>>()?;
+    Ok((actions, request))
 }
 
 /// Most block actions a PlayerAuthInput may carry.
@@ -148,9 +161,12 @@ impl Encode for PlayerAuthInput {
         self.interact_rotation.write(writer);
         writer.var_u64(self.tick);
         self.delta.write(writer);
-        // No item interaction or item stack request.
+        // No item interaction.
         writer.bool(false);
-        writer.bool(false);
+        writer.bool(self.item_stack_request.is_some());
+        if let Some(request) = &self.item_stack_request {
+            request.write(writer);
+        }
         writer.bool(!self.block_actions.is_empty());
         if !self.block_actions.is_empty() {
             writer.var_u32(u32::try_from(self.block_actions.len()).expect("a few actions"));
@@ -243,6 +259,7 @@ mod tests {
             },
             block_actions: Vec::new(),
             block_actions_unread: false,
+            item_stack_request: None,
         }
     }
 
@@ -307,8 +324,32 @@ mod tests {
     }
 
     #[test]
+    fn item_stack_requests_are_read_along_with_block_actions() {
+        use crate::packets::StackAction;
+        let mining = PlayerAuthInput {
+            item_stack_request: Some(StackRequest {
+                id: -7,
+                actions: vec![StackAction::MineBlock {
+                    hotbar_slot: 0,
+                    predicted_durability: 3,
+                    stack_id: 12,
+                }],
+                filter_strings: Vec::new(),
+                filter_cause: 0,
+            }),
+            block_actions: vec![BlockAction {
+                action: crate::packets::player_action::START_BREAK,
+                position: crate::types::BlockPos { x: 1, y: -61, z: 1 },
+                face: 1,
+            }],
+            ..input()
+        };
+        assert_eq!(decode_input(&mining.encode()), mining);
+    }
+
+    #[test]
     fn an_unreadable_tail_keeps_the_movement() {
-        // An item stack request hides the block actions.
+        // An item stack request that ends early.
         let input = decode_input(&with_tail(&[0x00, 0x01, 0x05, 0x06]));
         assert!(input.block_actions_unread);
         assert_eq!(input.position, super::tests::input().position);

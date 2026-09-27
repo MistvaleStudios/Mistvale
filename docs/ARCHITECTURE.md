@@ -372,8 +372,8 @@ Dragonfly's values.
 
 | Client sends | Server replies |
 |---|---|
-| ResourcePackClientResponse `resourcepackstackfinished` | JigsawStructureData (313; NBT with empty `processors`, `template_pools`, `jigsaws`, `structure_sets` lists), VoxelShapes (337, empty), StartGame (11), ItemRegistry (162, empty) |
-| RequestChunkRadius (69) | ChunkRadiusUpdated (70, capped at 8), NetworkChunkPublisherUpdate (121: spawn and radius × 16 blocks), every LevelChunk (58) in the circle nearest-first, then on the first request PlayStatus `PlayerSpawn` + CreativeContent (145, empty) |
+| ResourcePackClientResponse `resourcepackstackfinished` | JigsawStructureData (313; NBT with empty `processors`, `template_pools`, `jigsaws`, `structure_sets` lists), VoxelShapes (337, empty), StartGame (11), ItemRegistry (162, every vanilla item) |
+| RequestChunkRadius (69) | ChunkRadiusUpdated (70, capped at 8), NetworkChunkPublisherUpdate (121: spawn and radius × 16 blocks), every LevelChunk (58) in the circle nearest-first, then on the first request the player's InventoryContent (49: windows 0, 119 offhand, 120 armour), PlayStatus `PlayerSpawn` + CreativeContent (145, the vanilla creative inventory) |
 | SetLocalPlayerAsInitialized (113) | nothing; the player is in the world |
 | anything else once in the world, e.g. PlayerAuthInput (144) every tick | ignored for now |
 
@@ -679,19 +679,79 @@ DTLS, SCTP, and multi-segment messages both ways.
     items, and there is no survival break timing or tool check yet.
   - Breaking also sends a LevelEvent 2001 (`DESTROY_BLOCK`, with the broken block's
     network ID) to the chunk's viewers: the breaking particles and sound.
-- **Inventory (first cut):** `inventory` gives every player a fixed creative hotbar of
-  nine vanilla blocks without block states: stone, grass, dirt, cobblestone, oak planks,
-  sand, glass, white wool and bookshelf.
-  - The ItemRegistry sent with StartGame lists only these items, with vanilla's item
-    network IDs and entry version 2, as in PocketMine's `required_item_list.json`.
-  - An InventoryContent for window 0 goes out at spawn. Each stack has a unique stack
-    network ID, and each block item carries its block's hashed network ID.
-  - Stacks never run out, and inventory moves (item stack requests) are not handled.
+- **Items (implemented)** in `items`: every vanilla item, loaded once from
+  `data/items.json`, which `tools/item_data.py` generates from PocketMine's BedrockData
+  (CC0 1.0), currently tag `bedrock-1.26.30`, the newest published.
+  - About 1,930 items: name, network ID, version, component-based flag with the
+    components converted to network NBT, the largest stack, and for about 1,300 block
+    items the block state they place (the state the creative inventory shows).
+  - The ItemRegistry packet tells the client every item's network ID, so data from
+    1.26.30 works with 1.26.51; items added since are simply unknown.
+  - Largest stacks come from components where present, and otherwise from a table of
+    suffixes and names in the script (tools and armour 1, pearls and signs 16, the rest
+    64).
+  - The creative inventory: 127 groups (category, name, icon) and about 1,940 items.
+    Entries with NBT (enchanted books, fireworks and so on) are left out until items
+    carry user data. Creative network IDs count from 1.
+  - The ItemRegistry and CreativeContent packets are encoded once and shared.
+- **Inventories (implemented)** in `inventory`: the server owns each player's 36 main
+  slots (hotbar 0 to 8), four armour slots, the offhand and the cursor.
+  - New players start with nothing; the creative inventory has everything.
+  - **Opening the screen:** the inventory key sends Interact action 6 (open
+    inventory), and the client shows the screen only once the server answers with
+    ContainerOpen (window 0, type 0xFF, the player's block, entity -1). A second open
+    while it is open is not answered: Dragonfly notes that opening twice crashes the
+    client. The client's ContainerClose (47) for window 0 is echoed back (type 0, not
+    server-side), and anything left on the cursor goes into the first free slot, with
+    the inventory and cursor sent again;
+    window 0xFF (inventory and chat together) just marks it closed. Without these, the
+    screen never opens (found live on 2026-09-27).
+  - Every stack has a stack network ID, unique per player. A whole stack that moves
+    keeps its ID; a part that splits off, or a creative item landing, gets a new one.
+  - **Item stack requests** (147) are applied whole or not at all, on a copy, and
+    answered with ItemStackResponse (148): OK with the touched slots' counts and stack
+    IDs, grouped by the container names the client used, or an error, which makes the
+    client undo the request. A request that cannot be decoded is ignored.
+  - Supported actions: take, place (onto nothing or the same item, up to its largest
+    stack), swap, destroy and creative pick (creative only), plus the informational
+    craft-results and mine-block actions. Drop, consume, create and crafting are
+    rejected for now.
+  - Each slot names the stack the client believes is there: its stack ID, 0 for an
+    empty slot, or a negative request ID. The client sends requests without waiting
+    for answers, so a request ID stands for the stack that request (this one or an
+    earlier one) left in the slot. As in Dragonfly, the stack IDs each of the last 64
+    accepted requests left behind are remembered to resolve these. Painting (drag
+    splitting), double-click gathering and the stash on closing all depend on it
+    (found live on 2026-09-27).
+  - After a rejected request, the server also sends the whole inventory
+    (InventoryContent for windows 0, 119 and 120, and InventorySlot for the cursor,
+    slot 0 of UI window 124). The client undoes a rejection by itself, but a rejected
+    drop once left a slot unusable. The same is sent for an item stack request that
+    cannot be read and for any inventory transaction other than item use, since
+    neither can be answered.
+  - Containers: hotbar 28, inventory 29, combined 12 (all the main slots, by index),
+    armour 6, offhand 34 (slot 1, or 0), cursor 59, created output 60 (slot 50), as
+    gophertunnel and PocketMine number them. A 1.26.51 client used these on
+    2026-09-27. Mojang's schema lists the names in declaration order (hotbar 31, cursor
+    62), but RecipeFood, RecipeBlocks and RecipeFurnaceItems have the values 64 to 66.
+  - A creative pick puts a full stack of the item in the created output, which lasts
+    only for the request.
+  - PlayerAuthInput can carry a request (a tool's durability while mining); it is read
+    and answered like the others, and the block actions after it are no longer lost.
+  - Saved in `players/<uuid>.json` under `inventory` (`main`, `armor`, `offhand`, each a
+    list of `{slot, item, count, meta}` by item name). An item on the cursor is saved
+    into the first free slot. Unknown items and bad slots are skipped with a warning;
+    counts are capped at the item's largest stack. Files from before inventories start
+    empty.
+  - The session owns the inventory; each accepted change sends a snapshot to the
+    player's `Players` entry, so the periodic saves include it.
 - **Block placing (implemented):** placing arrives in InventoryTransaction as a UseItem
   transaction with action ClickBlock; only that part is decoded.
   - The decode fails soft: an unreadable transaction is ignored.
-  - The block goes against the clicked face, and must come from a hotbar slot whose item
-    matches the held one. The target must be reachable, in a loaded chunk, air, and not
+  - The block goes against the clicked face. It is the block of the server's stack in
+    the hotbar slot, which must be the item the client says it holds; non-block items
+    place nothing. Creative placing uses nothing up. Blocks go in the state the creative
+    inventory shows, so rotations, slabs and doors are not placed properly yet. The target must be reachable, in a loaded chunk, air, and not
     inside the placing player's own box (a quick check in the session).
   - `Server::place_block` refuses a block that overlaps **any** online player's box.
     `Players::occupies` uses a box 0.6 wide and 1.8 tall (1.5 while sneaking); touching a
@@ -720,7 +780,7 @@ DTLS, SCTP, and multi-segment messages both ways.
     plus 4096 indices per sub-chunk, the way vanilla worlds store them. So a LevelDB
     backend needs no knowledge of network IDs.
   - The world maps its network IDs (state hashes) back to names through a table of every
-    block it can hold: air, the superflat layers and the hotbar blocks.
+    block it can hold: air, the superflat layers and every block item's state.
   - A block with no known name is stored as a raw placeholder,
     `mistvale:raw_network_id` with its ID as a state, so nothing is lost.
   - `BinStorage` writes one file per changed column, `chunks/c.<x>.<z>.bin`: the magic
@@ -940,10 +1000,13 @@ Each step starts only after explicit confirmation.
 | 18 | Plugin API: plugins in folders with a `plugin.json` manifest (name, description, version, author, main); events `player_quit`, `player_chat` (cancellable), `block_break`, `block_place`; actions `server.send_message(player, message)` and `server.kick(player, reason?)` | The sample plugin greets a player privately, blocks a filtered word, kicks on `!kickme`, logs block changes and announces leaving | ✅ done 2026-09-26; folders, manifests, every event and action, and hot reload all worked live (commit `7cf9259`) |
 | 19 | Plugin API and console polish: `player.send_message(message)` and `player.kick(reason?)` methods replace the `server.*` versions; plugin output labelled with the plugin's name; `§` colour codes shown as terminal colours; chat logs moved to debug | The sample plugin works as before; the console shows `hello:` lines and the welcome in yellow, and no chat lines | ✅ done 2026-09-26; methods, plugin names and colours all worked live |
 | 20 | `mistvale.toml` created with defaults; `[logs] chat` and `system_noise` set the console filter; chat back at info; connection, login and key-fetch lines moved to debug; one "joined/left the game" line per player; `server.player(uuid)` | A fresh start writes the file; chat shows or hides with `chat`; debug lines appear with `system_noise`; `!wave` reaches the newest player | ✅ done 2026-09-26; config, log toggles and lookup all worked live |
-| 21 | Console lines as `<YY/MM/DD HH:MM:SS.SSS> LEVEL [target] message` in local time, with grey time, coloured three-letter levels and cyan targets | The console shows `INF [hello]` and `INF [mistvale]` lines in colour | ✅ done 2026-09-26; the format and colours look right (seconds added after the first test) |
+| 21 | Console lines as `<YY/MM/DD HH:MM:SS.SSS> LEVEL [target] message` in local time, with grey time, coloured three-letter levels and cyan targets | The console shows `INF [hello]` and `INF [mistvale]` lines in colour | ✅ done 2026-09-26; the format and colours look right (seconds added after the first test) (commit `c126468`) |
+| 22 | Inventories, part A: every vanilla item in the ItemRegistry and the vanilla creative inventory (generated from BedrockData); a server-owned inventory per player (main, armour, offhand, cursor), empty for new players, saved in the player file; the inventory screen opened on request (Interact → ContainerOpen, ContainerClose echoed); item stack requests (take, place, swap, destroy, creative pick) answered with ItemStackResponse; placing uses the held stack | The creative menu is full; items can be picked, moved, split, merged and swapped; everything is where it was after rejoining | ✅ done 2026-09-27 after three live tests: the screen would not open (no ContainerOpen); then painting, gathering, drops and the cursor stash failed (request-ID references; resync after rejections); now all work, and rejected drops snap back cleanly |
 
 Later steps are proposed but not yet scheduled:
-- vanilla item and biome data (ItemRegistry, BiomeDefinitionList, CreativeContent)
+- inventories, part B: dropped items, pickup, `player.give`; then block interactions and
+  containers, then health, damage and survival (the Top 3 adopted on 2026-09-26)
+- vanilla biome data (BiomeDefinitionList)
 - real skins forwarded from each client's login data (persona pieces and tints included)
 - movement validation (speed and teleport checks) and server corrections
 - cancellable block events (undoing the change on the client) and more plugin actions
@@ -959,9 +1022,8 @@ Later steps are proposed but not yet scheduled:
   - NAT'd or public deployments using advertised addresses
 - **Minimal registries work for spawning.** The spawn sends an empty ItemRegistry and no
   BiomeDefinitionList, mirroring gophertunnel's minimal server. A live 1.26.51 client
-  spawned with them on 2026-09-25. Inventories and the creative menu stay empty until
-  vanilla item data arrives, which would come from a BDS data dump subject to licensing
-  (see below).
+  spawned with them on 2026-09-25. Vanilla item data now comes from PocketMine's
+  BedrockData, which is CC0 (step 22).
 - **str0m's SDP candidate parser is strict.** It expects the `ufrag` extension after
   `network-id`, while libwebrtc (and so our answer) writes it before. It then silently
   drops the candidate. This only affects str0m acting as a client, as in the loopback
@@ -1000,11 +1062,13 @@ Later steps are proposed but not yet scheduled:
   one. Blocks outside the world's known table are kept as raw placeholders. Changed
   columns still stay in memory until shutdown; unloading is not needed at this scale
   yet.
-- **A partial ItemRegistry is untested with a live client.** Only nine items are
-  registered, with vanilla's IDs, where vanilla sends about 1,900. An empty registry
-  worked for spawning, but held items might not render or be usable. The hotbar blocks
-  are also assumed to have no block states in 26.51. If one shows as an unknown block,
-  its state hash is wrong.
+- **The full item registry and inventory protocol are untested with a live client.**
+  The wire layouts follow gophertunnel for 2193, which differs from PocketMine's 1.26.30
+  (the action header gained a varint type and slot stack IDs became fixed 32-bit).
+  Mojang's schema omits optional-field markers, so it was used only as a cross-check.
+  The container IDs are the biggest risk: if every request is rejected with "no slot",
+  the numbering is off. Item data is from 1.26.30, so blocks or items added in 1.26.40
+  and 1.26.50 are missing.
 - **Players are authenticated (resolved 2026-09-26).** Login tokens
   are verified against the Minecraft authorization service (§4.5, Authentication). The
   offer's `cpk` signing its DTLS fingerprints binds the connection to the verified key.

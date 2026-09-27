@@ -274,7 +274,9 @@ pub struct ItemEntry {
     pub runtime_id: i16,
     pub component_based: bool,
     pub version: i32,
-    pub data: Compound,
+    /// The item's components as an encoded network NBT compound; `None` sends
+    /// an empty compound.
+    pub components: Option<Vec<u8>>,
 }
 
 impl Packet for ItemRegistry {
@@ -289,24 +291,11 @@ impl Encode for ItemRegistry {
             w.i16_le(item.runtime_id);
             w.bool(item.component_based);
             w.var_i32(item.version);
-            item.data.write_network(w);
+            match &item.components {
+                Some(components) => w.raw(components),
+                None => Compound::new().write_network(w),
+            }
         }
-    }
-}
-
-/// The creative inventory. Mistvale has no creative items yet, so it is empty.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CreativeContent;
-
-impl Packet for CreativeContent {
-    const ID: u32 = id::CREATIVE_CONTENT;
-}
-
-impl Encode for CreativeContent {
-    fn encode_payload(&self, w: &mut Writer) {
-        // No groups and no items.
-        w.var_u32(0);
-        w.var_u32(0);
     }
 }
 
@@ -508,7 +497,7 @@ mod tests {
 
     #[test]
     fn small_spawn_packets_match_the_wire() {
-        assert_eq!(payload(&CreativeContent), [0, 0]);
+        assert_eq!(payload(&crate::packets::CreativeContent::default()), [0, 0]);
         assert_eq!(payload(&VoxelShapes), [0, 0, 0, 0]);
         assert_eq!(payload(&ChunkRadiusUpdated { radius: 8 }), [16]);
         assert_eq!(

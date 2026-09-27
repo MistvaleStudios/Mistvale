@@ -64,6 +64,7 @@ async fn the_sample_plugin_welcomes_a_joining_player_once() {
             centre: ChunkPos::new(0, 0),
             radius: 4,
         },
+        inventory: Default::default(),
         outbound,
     });
     server.plugins.dispatch(Event::PlayerJoin(Player {

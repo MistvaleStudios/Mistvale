@@ -19,10 +19,14 @@ pub mod id {
     pub const LEVEL_EVENT: u32 = 25;
     pub const UPDATE_ATTRIBUTES: u32 = 29;
     pub const INVENTORY_TRANSACTION: u32 = 30;
+    pub const INTERACT: u32 = 33;
     pub const PLAYER_ACTION: u32 = 36;
     pub const SET_ACTOR_DATA: u32 = 39;
     pub const ANIMATE: u32 = 44;
+    pub const CONTAINER_OPEN: u32 = 46;
+    pub const CONTAINER_CLOSE: u32 = 47;
     pub const INVENTORY_CONTENT: u32 = 49;
+    pub const INVENTORY_SLOT: u32 = 50;
     pub const LEVEL_CHUNK: u32 = 58;
     pub const PLAYER_LIST: u32 = 63;
     pub const REQUEST_CHUNK_RADIUS: u32 = 69;
@@ -34,6 +38,8 @@ pub mod id {
     pub const NETWORK_SETTINGS: u32 = 143;
     pub const PLAYER_AUTH_INPUT: u32 = 144;
     pub const CREATIVE_CONTENT: u32 = 145;
+    pub const ITEM_STACK_REQUEST: u32 = 147;
+    pub const ITEM_STACK_RESPONSE: u32 = 148;
     pub const ITEM_REGISTRY: u32 = 162;
     pub const UPDATE_ABILITIES: u32 = 187;
     pub const REQUEST_NETWORK_SETTINGS: u32 = 193;

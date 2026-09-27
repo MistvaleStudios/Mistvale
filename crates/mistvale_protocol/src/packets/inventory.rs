@@ -8,7 +8,8 @@ use crate::types::{BlockPos, Vec3};
 const MAX_LIST: u32 = 256;
 
 /// An item stack as sent in inventories and transactions. User data (NBT,
-/// can-place-on and can-break lists) is not supported and sent empty.
+/// can-place-on and can-break lists) is not supported and sent empty; shields
+/// also carry a blocking tick, sent as 0.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ItemInstance {
     /// The item's network ID from the ItemRegistry; 0 is an empty slot.
@@ -19,6 +20,8 @@ pub struct ItemInstance {
     pub stack_network_id: Option<i32>,
     /// For block items, the network ID of the block they place.
     pub block_runtime_id: u32,
+    /// Whether the item is a shield, whose user data has an extra field.
+    pub shield: bool,
 }
 
 impl ItemInstance {
@@ -28,6 +31,7 @@ impl ItemInstance {
         metadata: 0,
         stack_network_id: None,
         block_runtime_id: 0,
+        shield: false,
     };
 
     pub fn is_empty(&self) -> bool {
@@ -43,15 +47,7 @@ impl ItemInstance {
             writer.var_i32(id);
         }
         writer.var_u32(self.block_runtime_id);
-        if self.is_empty() {
-            writer.var_u32(0);
-        } else {
-            // User data: no NBT (length 0), no can-place-on or can-break entries.
-            writer.var_u32(10);
-            writer.i16_le(0);
-            writer.u32_le(0);
-            writer.u32_le(0);
-        }
+        write_user_data(writer, !self.is_empty(), self.shield);
     }
 
     /// Reads an item, skipping its user data.
@@ -72,7 +68,26 @@ impl ItemInstance {
             metadata,
             stack_network_id,
             block_runtime_id,
+            // Only the registry knows; nothing read needs it.
+            shield: false,
         })
+    }
+}
+
+/// Writes an item's empty user data: nothing for an empty slot; otherwise no
+/// NBT (length 0) and no can-place-on or can-break entries, plus a blocking
+/// tick of 0 for shields.
+pub(crate) fn write_user_data(writer: &mut Writer, present: bool, shield: bool) {
+    if !present {
+        writer.var_u32(0);
+        return;
+    }
+    writer.var_u32(if shield { 18 } else { 10 });
+    writer.i16_le(0);
+    writer.u32_le(0);
+    writer.u32_le(0);
+    if shield {
+        writer.i64_le(0);
     }
 }
 
@@ -102,6 +117,32 @@ impl Encode for InventoryContent {
         writer.u8(0);
         writer.bool(false);
         ItemInstance::EMPTY.write(writer);
+    }
+}
+
+/// Window ID of the UI inventory, whose slot 0 is the cursor.
+pub const UI_WINDOW: u32 = 124;
+
+/// Replaces one slot of one of the player's windows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventorySlot {
+    pub window_id: u32,
+    pub slot: u32,
+    pub item: ItemInstance,
+}
+
+impl Packet for InventorySlot {
+    const ID: u32 = id::INVENTORY_SLOT;
+}
+
+impl Encode for InventorySlot {
+    fn encode_payload(&self, writer: &mut Writer) {
+        writer.var_u32(self.window_id);
+        writer.var_u32(self.slot);
+        // No container name and no storage item, both optional.
+        writer.bool(false);
+        writer.bool(false);
+        self.item.write(writer);
     }
 }
 
@@ -312,6 +353,7 @@ mod tests {
             metadata: 0,
             stack_network_id: Some(1),
             block_runtime_id: 12345,
+            shield: false,
         }
     }
 
@@ -328,6 +370,41 @@ mod tests {
         assert_eq!(bytes[..7], [0x01, 0x00, 0x40, 0x00, 0x00, 0x01, 0x02]);
         let item = ItemInstance::read(&mut Reader::new(&bytes)).unwrap();
         assert_eq!(item, stone());
+    }
+
+    #[test]
+    fn clearing_the_cursor_is_a_short_packet() {
+        let packet = InventorySlot {
+            window_id: UI_WINDOW,
+            slot: 0,
+            item: ItemInstance::EMPTY,
+        };
+        let bytes = packet.encode();
+        let (header, mut payload) = read_header(&bytes).unwrap();
+        assert_eq!(header.id, id::INVENTORY_SLOT);
+        assert_eq!(
+            payload.take(payload.remaining()).unwrap(),
+            [124, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn shields_carry_a_blocking_tick() {
+        let shield = ItemInstance {
+            network_id: 387,
+            count: 1,
+            shield: true,
+            ..stone()
+        };
+        let mut writer = Writer::new();
+        shield.write(&mut writer);
+        let bytes = writer.into_bytes();
+        // The user data is 18 bytes long: NBT length, two empty lists, the tick.
+        assert_eq!(bytes[bytes.len() - 19], 18);
+        assert_eq!(
+            ItemInstance::read(&mut Reader::new(&bytes)).unwrap().count,
+            1
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@ use mistvale_protocol::types::{BlockPos, ChunkPos};
 
 use uuid::Uuid;
 
-use crate::inventory;
+use crate::items::items;
 use crate::storage::{
     BLOCKS, BinStorage, SavedPlayer, StoredColumn, StoredSubChunk, WorldStorage, raw_block,
     raw_network_id,
@@ -106,7 +106,7 @@ impl World {
         let known = [BlockState::new("minecraft:air")]
             .into_iter()
             .chain(layers.iter().cloned())
-            .chain(inventory::block_states())
+            .chain(items().block_states().cloned())
             .map(|state| (state.network_id(), state))
             .collect();
 
@@ -629,6 +629,7 @@ mod tests {
             yaw: 180.0,
             head_yaw: 180.0,
             flying: true,
+            inventory: None,
         };
         let world = World::open(&directory).unwrap();
         assert_eq!(world.load_player(uuid), None);
@@ -636,10 +637,10 @@ mod tests {
         drop(world);
 
         let world = World::open(&directory).unwrap();
-        assert_eq!(world.load_player(uuid), Some(there));
+        assert_eq!(world.load_player(uuid), Some(there.clone()));
         let lost = SavedPlayer {
             y: -1000.0,
-            ..there
+            ..there.clone()
         };
         world.save_player(uuid, &lost).unwrap();
         assert_eq!(world.load_player(uuid), None, "back to the spawn");

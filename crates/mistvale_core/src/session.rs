@@ -16,12 +16,14 @@
 //!    [`Players`](crate::players::Players) and plugins hear `player_join`.
 //!
 //! From then on, chat messages (Text) are relayed to every player unless a
-//! plugin cancels them, and plugins hear of blocks broken and placed. Plugins
+//! plugin cancels them, and plugins hear of blocks broken and placed. Item
+//! stack requests move items in the player's [`Inventory`], which is saved
+//! with the player. Plugins
 //! that heard `player_join` hear `player_quit` when the session ends.
 
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -31,16 +33,19 @@ use mistvale_protocol::batch::{self, BatchError, Compression, CompressionAlgorit
 use mistvale_protocol::io::DecodeError;
 use mistvale_protocol::login::{ConnectionRequest, IdentityClaims, LoginError};
 use mistvale_protocol::nbt::Compound;
-use mistvale_protocol::packet::{self, Encode as _, id};
+use mistvale_protocol::packet::{self, Encode, id};
 use mistvale_protocol::packets::{
-    AbilityData, AbilityLayer, Attribute, ChunkRadiusUpdated, CreativeContent, Disconnect,
-    DisconnectMessage, DisconnectReason, EXEMPTED_PACKS, GameRule, GameRuleValue,
-    InventoryTransaction, JigsawStructureData, Login, NetworkChunkPublisherUpdate, NetworkSettings,
-    PackResponse, PlayStatus, PlayStatusCode, PlayerAction, PlayerAuthInput,
+    AbilityData, AbilityLayer, Attribute, ChunkRadiusUpdated, Disconnect, DisconnectMessage,
+    DisconnectReason, EXEMPTED_PACKS, GameRule, GameRuleValue, InventoryTransaction,
+    ItemStackRequest, ItemStackResponse, JigsawStructureData, Login, NetworkChunkPublisherUpdate,
+    NetworkSettings, PackResponse, PlayStatus, PlayStatusCode, PlayerAction, PlayerAuthInput,
     PlayerMovementSettings, RequestChunkRadius, RequestNetworkSettings, ResourcePackClientResponse,
     ResourcePackStack, ResourcePacksInfo, SetActorData, SetLocalPlayerAsInitialized, StackPack,
-    StartGame, Text, TextType, UpdateAbilities, UpdateAttributes, VoxelShapes, ability, input_flag,
-    player_action, use_item_action,
+    StackResponse, StartGame, Text, TextType, UpdateAbilities, UpdateAttributes, VoxelShapes,
+    ability, input_flag, player_action, use_item_action,
+};
+use mistvale_protocol::packets::{
+    ContainerClose, ContainerOpen, Interact, NO_WINDOW, OWN_INVENTORY_WINDOW, interact_action,
 };
 use mistvale_protocol::types::{BlockPos, ChunkPos, Vec3};
 use mistvale_protocol::{GAME_VERSION, PROTOCOL_VERSION};
@@ -48,14 +53,15 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::auth::AuthError;
-use crate::inventory;
+use crate::inventory::Inventory;
+use crate::items::items;
 use crate::logins::KickNotice;
 use crate::players::{
     EYE_HEIGHT, Joining, Movement, OUTBOUND_QUEUE, Profile, STANDING_HEIGHT, View, body_overlaps,
     player_metadata,
 };
 use crate::server::{self, Server};
-use crate::storage::SavedPlayer;
+use crate::storage::{SavedInventory, SavedPlayer};
 use crate::view::ChunkView;
 use crate::world::{MAX_Y, MIN_Y, OVERWORLD, World};
 
@@ -82,6 +88,15 @@ const MAX_CHAT_LENGTH: usize = 512;
 /// How long after a player spawns plugins hear of it: 15 ticks, so messages
 /// they send arrive once the client's HUD is ready.
 const JOIN_EVENT_DELAY: Duration = Duration::from_millis(750);
+
+/// Everyone plays in creative mode for now: creative items can be taken from
+/// the creative inventory, and placing blocks uses none up.
+const CREATIVE: bool = true;
+
+/// The ItemRegistry and CreativeContent packets, the same for every player,
+/// encoded once.
+static ITEM_REGISTRY: LazyLock<Vec<u8>> = LazyLock::new(|| items().registry_packet().encode());
+static CREATIVE_CONTENT: LazyLock<Vec<u8>> = LazyLock::new(|| items().creative_packet().encode());
 
 /// Longest a chat message waits for plugins to decide whether to cancel it.
 /// Past that it is sent anyway: a stuck plugin must not silence chat.
@@ -170,7 +185,7 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                                 // Kicks this player's older session, if any.
                                 login_claim = Some(server.logins.claim(uuid, kick.clone()));
                             }
-                            SessionEvent::Joined { profile, movement, view } => {
+                            SessionEvent::Joined { profile, movement, view, inventory } => {
                                 let player = Player {
                                     name: profile.name.clone(),
                                     uuid: profile.uuid.to_string(),
@@ -182,6 +197,7 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                                     profile,
                                     movement,
                                     view,
+                                    inventory,
                                     outbound: outbound.clone(),
                                 }));
                                 // Plugins hear of the join a little later: the
@@ -232,6 +248,11 @@ async fn serve(connection: &mut Connection, server: &Server, session: &mut Sessi
                             SessionEvent::Sneaking(sneaking) => {
                                 if let Some(membership) = &membership {
                                     membership.sneaking(sneaking);
+                                }
+                            }
+                            SessionEvent::InventoryChanged(inventory) => {
+                                if let Some(membership) = &membership {
+                                    membership.inventory(inventory);
                                 }
                             }
                             SessionEvent::Flying(flying) => {
@@ -386,6 +407,7 @@ pub enum SessionEvent {
         profile: Profile,
         movement: Movement,
         view: View,
+        inventory: SavedInventory,
     },
     /// The player moved or looked around.
     Moved(Movement),
@@ -401,6 +423,8 @@ pub enum SessionEvent {
     Sneaking(bool),
     /// The player started or stopped flying.
     Flying(bool),
+    /// The player's inventory changed; this is it now, for saving.
+    InventoryChanged(SavedInventory),
     /// The player said something in chat.
     Chat(String),
 }
@@ -495,6 +519,11 @@ pub struct Session {
     flying: bool,
     /// Where the player is, as last reported.
     movement: Movement,
+    /// What the player carries; empty until a saved one is loaded.
+    inventory: Inventory,
+    /// Whether the player's inventory screen is open. Opening it twice makes
+    /// the client crash, and latency can make it ask twice.
+    inventory_open: bool,
     world: Arc<World>,
 }
 
@@ -520,6 +549,8 @@ impl Session {
             },
             view: ChunkView::new(),
             flying: false,
+            inventory: Inventory::default(),
+            inventory_open: false,
             world,
         }
     }
@@ -536,7 +567,16 @@ impl Session {
     /// The player's UUID and what to save for them, once they have been in
     /// the world; players who never finished spawning are not saved.
     pub fn saved_player(&self) -> Option<(Uuid, SavedPlayer)> {
-        (self.stage == Stage::InGame).then(|| (self.uuid, self.movement.saved(self.flying)))
+        (self.stage == Stage::InGame).then(|| {
+            let mut saved = self.movement.saved(self.flying);
+            saved.inventory = Some(self.inventory.saved());
+            (self.uuid, saved)
+        })
+    }
+
+    /// What the player carries.
+    pub fn inventory(&self) -> &Inventory {
+        &self.inventory
     }
 
     /// Handles one encoded packet (header and payload).
@@ -561,13 +601,35 @@ impl Session {
             (Stage::InGame, id::TEXT) => Ok(self.text(packet::decode(payload)?)),
             (Stage::InGame, id::PLAYER_AUTH_INPUT) => Ok(self.auth_input(packet::decode(payload)?)),
             (Stage::InGame, id::PLAYER_ACTION) => Ok(self.player_action(packet::decode(payload)?)),
+            // The inventory screen opens only once the server says so.
+            (stage, id::INTERACT) if stage.in_world() => match packet::decode(payload) {
+                Ok(interact) => Ok(self.interact(interact)),
+                Err(err) => {
+                    tracing::debug!(player = %self.player, %err, "ignoring an unreadable interaction");
+                    Ok(Reply::default())
+                }
+            },
+            (stage, id::CONTAINER_CLOSE) if stage.in_world() => {
+                Ok(self.container_close(packet::decode(payload)?))
+            }
+            // A request that cannot be read (such as auto-crafting, which is
+            // not supported) cannot be answered either; the client's view of
+            // its inventory is corrected at the next accepted request.
+            // It cannot be answered, so the client is shown its inventory.
+            (stage, id::ITEM_STACK_REQUEST) if stage.in_world() => match packet::decode(payload) {
+                Ok(request) => Ok(self.item_stack_request(request)),
+                Err(err) => {
+                    tracing::debug!(player = %self.player, %err, "ignoring an unreadable item stack request");
+                    Ok(Reply::send(self.inventory_sync()))
+                }
+            },
             // Only item use is decoded; a transaction that cannot be read is
             // ignored rather than ending the session.
             (Stage::InGame, id::INVENTORY_TRANSACTION) => match packet::decode(payload) {
                 Ok(transaction) => Ok(self.inventory_transaction(transaction)),
                 Err(err) => {
                     tracing::debug!(player = %self.player, %err, "ignoring an unreadable inventory transaction");
-                    Ok(Reply::default())
+                    Ok(Reply::send(self.inventory_sync()))
                 }
             },
             (stage, id) if stage.in_world() => {
@@ -680,6 +742,9 @@ impl Session {
         if let Some(saved) = self.world.load_player(self.uuid) {
             self.movement = Movement::from_saved(&saved);
             self.flying = saved.flying;
+            if let Some(inventory) = &saved.inventory {
+                self.inventory = Inventory::from_saved(inventory);
+            }
             tracing::debug!(uuid = %self.uuid, ?saved, "restored the player's position");
         }
         tracing::debug!(name = %self.player, uuid = %self.uuid, "player logged in");
@@ -726,8 +791,8 @@ impl Session {
                     JigsawStructureData::empty().encode(),
                     VoxelShapes.encode(),
                     start_game(&self.world, self.entity_id, &self.movement).encode(),
-                    // Only the items players are given.
-                    inventory::item_registry().encode(),
+                    // Every vanilla item the server knows.
+                    ITEM_REGISTRY.clone(),
                 ]))
             }
             PackResponse::Downloading(_) => Ok(Reply::disconnect(
@@ -762,15 +827,15 @@ impl Session {
             // attribute and the walk and fly speeds of its ability layer.
             packets.push(self.own_attributes().encode());
             packets.push(self.own_abilities().encode());
-            // A hotbar of blocks to build with.
-            packets.push(inventory::starting_inventory().encode());
+            // What the player carries.
+            packets.extend(self.inventory.content().iter().map(Encode::encode));
             packets.push(
                 PlayStatus {
                     status: PlayStatusCode::PlayerSpawn,
                 }
                 .encode(),
             );
-            packets.push(CreativeContent.encode());
+            packets.push(CREATIVE_CONTENT.clone());
             self.stage = Stage::Initializing;
         }
         Reply {
@@ -888,6 +953,7 @@ impl Session {
                     centre: self.view.centre().unwrap_or_else(|| self.movement.chunk()),
                     radius: self.view.radius(),
                 },
+                inventory: self.inventory.saved(),
             }]
             .into_iter()
             // A returning player still flying: remembered for the next save.
@@ -945,25 +1011,137 @@ impl Session {
             packets.push(self.own_abilities().encode());
         }
 
+        // An item stack request riding along, such as a tool's durability.
+        let request = input.item_stack_request.clone();
         let mut reply = self.movement_input(input);
         reply.packets.extend(packets);
         reply.events.extend(events);
+        if let Some(request) = request {
+            let answer = self.item_stack_request(ItemStackRequest {
+                requests: vec![request],
+            });
+            reply.packets.extend(answer.packets);
+            reply.events.extend(answer.events);
+        }
         reply
     }
 
-    /// Right-clicking a block with a hotbar block places it against the
-    /// clicked face. The client predicts the placement, so a refused one is
-    /// undone with the block that is really there.
-    fn inventory_transaction(&mut self, transaction: InventoryTransaction) -> Reply {
-        let InventoryTransaction::UseItem(use_item) = transaction else {
+    /// Opens the player's inventory screen when they ask. Other interactions
+    /// (hovering over entities, leaving vehicles) need nothing yet.
+    fn interact(&mut self, interact: Interact) -> Reply {
+        if interact.action != interact_action::OPEN_INVENTORY || self.inventory_open {
             return Reply::default();
+        }
+        self.inventory_open = true;
+        let feet = BlockPos::containing(self.movement.feet());
+        Reply::send(vec![ContainerOpen::own_inventory(feet).encode()])
+    }
+
+    /// The player closed a window: confirmed, as the client waits for it.
+    /// Closing the inventory puts what is on the cursor back into it.
+    fn container_close(&mut self, close: ContainerClose) -> Reply {
+        match close.window_id {
+            OWN_INVENTORY_WINDOW => {
+                self.inventory_open = false;
+                let mut reply = Reply::send(vec![
+                    ContainerClose {
+                        window_id: OWN_INVENTORY_WINDOW,
+                        container_type: 0,
+                        server_side: false,
+                    }
+                    .encode(),
+                ]);
+                if self.inventory.return_cursor() {
+                    // The cursor too, or the client keeps showing the item on it.
+                    reply.packets.extend(self.inventory_sync());
+                    reply
+                        .events
+                        .push(SessionEvent::InventoryChanged(self.inventory.saved()));
+                }
+                reply
+            }
+            // Sent when the inventory and chat open together; nothing to confirm.
+            NO_WINDOW => {
+                self.inventory_open = false;
+                Reply::default()
+            }
+            other => Reply::send(vec![
+                ContainerClose {
+                    window_id: other,
+                    container_type: close.container_type,
+                    server_side: false,
+                }
+                .encode(),
+            ]),
+        }
+    }
+
+    /// Everything the player carries, cursor included, as the server has it:
+    /// what puts a client that went out of step back in line.
+    fn inventory_sync(&self) -> Vec<Vec<u8>> {
+        let mut packets: Vec<Vec<u8>> = self
+            .inventory
+            .content()
+            .iter()
+            .map(Encode::encode)
+            .collect();
+        packets.push(self.inventory.cursor_slot().encode());
+        packets
+    }
+
+    /// Applies each request to the inventory and answers them all. Accepted
+    /// changes are passed on, so saves include them.
+    fn item_stack_request(&mut self, packet: ItemStackRequest) -> Reply {
+        let responses: Vec<StackResponse> = packet
+            .requests
+            .iter()
+            .map(|request| self.inventory.handle(request, CREATIVE))
+            .collect();
+        let changed = responses
+            .iter()
+            .any(|response| !response.containers.is_empty());
+        let rejected = responses
+            .iter()
+            .any(|response| response.status != StackResponse::OK);
+        let mut packets = vec![ItemStackResponse { responses }.encode()];
+        // The client undoes a rejected request by itself, but not always
+        // cleanly (a rejected drop left an unusable slot), so it is also
+        // shown what the server really has.
+        if rejected {
+            packets.extend(self.inventory_sync());
+        }
+        Reply {
+            packets,
+            events: if changed {
+                vec![SessionEvent::InventoryChanged(self.inventory.saved())]
+            } else {
+                Vec::new()
+            },
+            ..Reply::default()
+        }
+    }
+
+    /// Right-clicking a block with a block item places it against the clicked
+    /// face. The held stack is the server's, and must be the item the client
+    /// says it holds. In creative mode, placing uses nothing up. The client
+    /// predicts the placement, so a refused one is undone with the block that
+    /// is really there.
+    fn inventory_transaction(&mut self, transaction: InventoryTransaction) -> Reply {
+        // Other transactions, such as an old-style drop, change items the
+        // client already moved on its side; none are carried out, so it is
+        // shown what it really has.
+        let InventoryTransaction::UseItem(use_item) = transaction else {
+            return Reply::send(self.inventory_sync());
         };
         if use_item.action != use_item_action::CLICK_BLOCK || use_item.held_item.is_empty() {
             return Reply::default();
         }
         let target = use_item.target();
-        let block = inventory::hotbar_block(use_item.hotbar_slot)
-            .filter(|block| *block == use_item.held_item.block_runtime_id);
+        let block = self
+            .inventory
+            .hotbar(use_item.hotbar_slot)
+            .filter(|stack| stack.item == use_item.held_item.network_id)
+            .and_then(|stack| items().get(stack.item)?.block_network_id);
         match block {
             Some(block) if self.may_place(target) => Reply {
                 events: vec![
@@ -1202,6 +1380,7 @@ mod tests {
     use mistvale_protocol::packets::{BlockAction, UseItem};
 
     use super::*;
+    use crate::inventory::TEST_KIT;
 
     /// The entity ID tests give the player.
     const PLAYER_ENTITY_ID: u64 = 1;
@@ -1403,19 +1582,22 @@ mod tests {
         let chunks = sent.iter().filter(|id| **id == id::LEVEL_CHUNK).count();
         assert_eq!(chunks, 49);
         // The player's own entity data (gravity), attributes and abilities
-        // (speeds) come just before PlayerSpawn.
+        // (speeds), then their inventory, offhand and armour, come just
+        // before PlayerSpawn and the creative inventory.
         assert_eq!(
-            sent[sent.len() - 6..],
+            sent[sent.len() - 8..],
             [
                 id::SET_ACTOR_DATA,
                 id::UPDATE_ATTRIBUTES,
                 id::UPDATE_ABILITIES,
                 id::INVENTORY_CONTENT,
+                id::INVENTORY_CONTENT,
+                id::INVENTORY_CONTENT,
                 id::PLAY_STATUS,
-                id::CREATIVE_CONTENT
+                id::CREATIVE_CONTENT,
             ]
         );
-        let attributes = &reply.packets[sent.len() - 5];
+        let attributes = &reply.packets[sent.len() - 7];
         let movement = b"minecraft:movement";
         let at = attributes
             .windows(movement.len())
@@ -1546,6 +1728,7 @@ mod tests {
                 profile,
                 movement,
                 view,
+                inventory,
             },
         ] = &reply.events[..]
         else {
@@ -1553,6 +1736,8 @@ mod tests {
         };
         assert_eq!(profile.name, session.player());
         assert!(!profile.uuid.is_nil());
+        // A new player carries nothing.
+        assert_eq!(*inventory, SavedInventory::default());
         // Their client shows the chunks around the spawn.
         assert_eq!(
             *view,
@@ -1611,6 +1796,7 @@ mod tests {
             delta: Vec3::default(),
             block_actions,
             block_actions_unread: false,
+            item_stack_request: None,
         }
         .encode()
     }
@@ -1627,11 +1813,63 @@ mod tests {
             entity_runtime_id: PLAYER_ENTITY_ID,
         };
         session.handle(&initialized.encode()).unwrap();
+        // Blocks to build with; new players start empty.
+        session.inventory = Inventory::with_hotbar(&TEST_KIT);
         session
     }
 
+    #[test]
+    fn the_inventory_screen_opens_when_asked_and_closes_confirmed() {
+        let mut session = in_game_session();
+        let open = Interact {
+            action: interact_action::OPEN_INVENTORY,
+            target_entity_runtime_id: PLAYER_ENTITY_ID,
+            position: None,
+        };
+        let reply = session.handle(&open.encode()).unwrap();
+        assert_eq!(ids(&reply), [id::CONTAINER_OPEN]);
+        // Window 0 of type inventory, at the block the player stands in.
+        assert_eq!(
+            reply.packets[0],
+            ContainerOpen::own_inventory(BlockPos { x: 0, y: -60, z: 0 }).encode()
+        );
+        // A second request while open would crash the client if answered.
+        assert!(session.handle(&open.encode()).unwrap().packets.is_empty());
+
+        // Closing with an item on the cursor puts it back.
+        session
+            .inventory
+            .cursor_for_test(session.inventory.hotbar(0).copied());
+        let close = ContainerClose {
+            window_id: OWN_INVENTORY_WINDOW,
+            container_type: 0,
+            server_side: false,
+        };
+        let reply = session.handle(&close.encode()).unwrap();
+        assert_eq!(
+            ids(&reply),
+            [
+                id::CONTAINER_CLOSE,
+                id::INVENTORY_CONTENT,
+                id::INVENTORY_CONTENT,
+                id::INVENTORY_CONTENT,
+                id::INVENTORY_SLOT
+            ]
+        );
+        assert!(matches!(
+            reply.events[..],
+            [SessionEvent::InventoryChanged(_)]
+        ));
+        // It can open again.
+        assert_eq!(
+            ids(&session.handle(&open.encode()).unwrap()),
+            [id::CONTAINER_OPEN]
+        );
+    }
+
     fn place(slot: i32, block_position: BlockPos, face: u8) -> Vec<u8> {
-        let held_item = inventory::starting_inventory().content[slot.clamp(0, 35) as usize];
+        let held_item =
+            Inventory::with_hotbar(&TEST_KIT).content()[0].content[slot.clamp(0, 35) as usize];
         InventoryTransaction::UseItem(UseItem {
             action: use_item_action::CLICK_BLOCK,
             trigger: 1,
@@ -1653,7 +1891,7 @@ mod tests {
         // Click the top (face 1) of the grass two blocks east of the player.
         let grass = BlockPos { x: 2, y: -61, z: 0 };
         let reply = session.handle(&place(0, grass, 1)).unwrap();
-        let stone = inventory::hotbar_block(0).unwrap();
+        let stone = mistvale_protocol::block::BlockState::new("minecraft:stone").network_id();
         assert_eq!(
             reply.events,
             [
@@ -1665,6 +1903,100 @@ mod tests {
             ]
         );
         assert!(reply.packets.is_empty());
+    }
+
+    fn swap_request(id: i32, first: u8, second: u8, session: &Session) -> ItemStackRequest {
+        use mistvale_protocol::packets::{
+            FullContainerName, StackAction, StackRequest, StackSlot, container,
+        };
+        let slot = |slot: u8| StackSlot {
+            container: FullContainerName::new(container::HOTBAR),
+            slot,
+            stack_id: session.inventory().hotbar(slot.into()).unwrap().id,
+        };
+        ItemStackRequest {
+            requests: vec![StackRequest {
+                id,
+                actions: vec![StackAction::Swap {
+                    source: slot(first),
+                    destination: slot(second),
+                }],
+                filter_strings: Vec::new(),
+                filter_cause: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn item_stack_requests_are_answered_and_saved() {
+        let mut session = in_game_session();
+        let dirt = *session.inventory().hotbar(2).unwrap();
+        let reply = session
+            .handle(&swap_request(-1, 0, 2, &session).encode())
+            .unwrap();
+        assert_eq!(ids(&reply), [id::ITEM_STACK_RESPONSE]);
+        assert_eq!(session.inventory().hotbar(0), Some(&dirt));
+        let [SessionEvent::InventoryChanged(saved)] = &reply.events[..] else {
+            panic!("expected an inventory change, got {:?}", reply.events);
+        };
+        assert_eq!(saved.main[0].item, "minecraft:dirt");
+        let (_, player) = session.saved_player().unwrap();
+        assert_eq!(player.inventory.as_ref(), Some(saved));
+
+        // A stale request is rejected and changes nothing.
+        let mut stale = swap_request(-3, 0, 2, &session);
+        if let mistvale_protocol::packets::StackAction::Swap { source, .. } =
+            &mut stale.requests[0].actions[0]
+        {
+            source.stack_id += 1000;
+        }
+        let reply = session.handle(&stale.encode()).unwrap();
+        assert_eq!(
+            ids(&reply),
+            [
+                id::ITEM_STACK_RESPONSE,
+                id::INVENTORY_CONTENT,
+                id::INVENTORY_CONTENT,
+                id::INVENTORY_CONTENT,
+                id::INVENTORY_SLOT
+            ]
+        );
+        assert!(reply.events.is_empty());
+        assert_eq!(session.inventory().hotbar(0), Some(&dirt));
+    }
+
+    #[test]
+    fn placing_uses_what_the_server_says_is_held() {
+        let mut session = in_game_session();
+        session
+            .handle(&swap_request(-1, 0, 2, &session).encode())
+            .unwrap();
+        // The client still claims to hold stone in slot 0: refused.
+        let grass = BlockPos { x: 2, y: -61, z: 0 };
+        let reply = session.handle(&place(0, grass, 1)).unwrap();
+        assert!(reply.events.is_empty());
+        assert_eq!(ids(&reply), [id::UPDATE_BLOCK]);
+
+        // Holding what the server has there, dirt, places dirt.
+        let held = session.inventory().hotbar(0).unwrap().instance();
+        let transaction = InventoryTransaction::UseItem(UseItem {
+            action: use_item_action::CLICK_BLOCK,
+            trigger: 1,
+            block_position: grass,
+            face: 1,
+            hotbar_slot: 0,
+            held_item: held,
+            player_position: Vec3::default(),
+            clicked_position: Vec3::default(),
+            block_runtime_id: 0,
+            client_prediction: 1,
+        });
+        let reply = session.handle(&transaction.encode()).unwrap();
+        let dirt = mistvale_protocol::block::BlockState::new("minecraft:dirt").network_id();
+        assert!(reply.events.contains(&SessionEvent::PlacedBlock {
+            pos: BlockPos { x: 2, y: -60, z: 0 },
+            block: dirt
+        }));
     }
 
     #[test]

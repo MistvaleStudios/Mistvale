@@ -231,6 +231,7 @@ mod tests {
                 centre: chunk,
                 radius: 4,
             },
+            inventory: Default::default(),
             outbound,
         });
         (membership, queue)

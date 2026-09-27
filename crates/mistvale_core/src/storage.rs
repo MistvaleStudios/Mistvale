@@ -78,7 +78,7 @@ pub enum StoreError {
 
 /// Where a player was when they last left: their feet, where they looked (in
 /// degrees), and whether they were flying. Saved as `players/<uuid>.json`.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedPlayer {
     pub x: f32,
     pub y: f32,
@@ -89,6 +89,39 @@ pub struct SavedPlayer {
     /// Absent from files saved before flying was remembered.
     #[serde(default)]
     pub flying: bool,
+    /// Absent from files saved before inventories were: those players get
+    /// the starter kit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<SavedInventory>,
+}
+
+/// A player's inventory, by slot. Items are saved by name, so their network
+/// IDs may change between versions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedInventory {
+    /// The 36 main slots, hotbar (0 to 8) first.
+    #[serde(default)]
+    pub main: Vec<SavedStack>,
+    #[serde(default)]
+    pub armor: Vec<SavedStack>,
+    /// At most one stack, in slot 0.
+    #[serde(default)]
+    pub offhand: Vec<SavedStack>,
+}
+
+/// Some of one item in one slot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedStack {
+    pub slot: u8,
+    /// The item's name, such as `minecraft:stone`.
+    pub item: String,
+    pub count: u8,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub meta: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 impl SavedPlayer {
@@ -460,9 +493,18 @@ mod tests {
             yaw: -90.0,
             head_yaw: -85.0,
             flying: true,
+            inventory: Some(SavedInventory {
+                main: vec![SavedStack {
+                    slot: 4,
+                    item: "minecraft:stone".into(),
+                    count: 12,
+                    meta: 0,
+                }],
+                ..SavedInventory::default()
+            }),
         };
         storage.save_player(uuid, &player).unwrap();
-        assert_eq!(storage.load_player(uuid).unwrap(), Some(player));
+        assert_eq!(storage.load_player(uuid).unwrap(), Some(player.clone()));
         assert!(world.join("players").join(format!("{uuid}.json")).is_file());
 
         // Files from before flying was saved mean "not flying".

@@ -19,7 +19,7 @@ use mistvale_protocol::types::{BlockPos, ChunkPos, Vec3};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use uuid::Uuid;
 
-use crate::storage::SavedPlayer;
+use crate::storage::{SavedInventory, SavedPlayer};
 
 /// Packets that may wait for one player before more are dropped.
 pub const OUTBOUND_QUEUE: usize = 256;
@@ -63,7 +63,8 @@ impl Movement {
         ChunkPos::of_block(BlockPos::containing(self.feet()))
     }
 
-    /// What is saved for the player: feet position, rotation and flying.
+    /// What is saved for the player: feet position, rotation and flying. The
+    /// inventory is left for the caller to add.
     pub fn saved(&self, flying: bool) -> SavedPlayer {
         let feet = self.feet();
         SavedPlayer {
@@ -74,6 +75,7 @@ impl Movement {
             yaw: self.yaw,
             head_yaw: self.head_yaw,
             flying,
+            inventory: None,
         }
     }
 
@@ -114,6 +116,8 @@ pub struct Joining {
     pub profile: Profile,
     pub movement: Movement,
     pub view: View,
+    /// What the player carries, as saved.
+    pub inventory: SavedInventory,
     pub outbound: Outbound,
 }
 
@@ -128,6 +132,8 @@ struct Online {
     flying: bool,
     /// Players whose entity this player's client has, by entity ID.
     seen: HashSet<u64>,
+    /// The player's inventory as last changed, for saving.
+    inventory: SavedInventory,
     outbound: Outbound,
 }
 
@@ -165,6 +171,7 @@ impl Players {
             profile,
             movement,
             view,
+            inventory,
             outbound,
         } = joining;
         let newcomer = Online {
@@ -175,6 +182,7 @@ impl Players {
             sneaking: false,
             flying: false,
             seen: HashSet::new(),
+            inventory,
             outbound,
         };
         let mut online = self.online();
@@ -208,7 +216,11 @@ impl Players {
     pub fn saved(&self) -> Vec<(Uuid, SavedPlayer)> {
         self.online()
             .values()
-            .map(|player| (player.profile.uuid, player.movement.saved(player.flying)))
+            .map(|player| {
+                let mut saved = player.movement.saved(player.flying);
+                saved.inventory = Some(player.inventory.clone());
+                (player.profile.uuid, saved)
+            })
             .collect()
     }
 
@@ -409,6 +421,13 @@ impl Membership<'_> {
         }
     }
 
+    /// Records what the player carries now, for saving.
+    pub fn inventory(&self, inventory: SavedInventory) {
+        if let Some(player) = self.players.online().get_mut(&self.entity_id) {
+            player.inventory = inventory;
+        }
+    }
+
     /// Records whether the player is flying, for saving.
     pub fn flying(&self, flying: bool) {
         if let Some(player) = self.players.online().get_mut(&self.entity_id) {
@@ -579,6 +598,7 @@ mod tests {
             },
             movement: standing_at(SPAWN_EYES),
             view: view_at(0, 0),
+            inventory: SavedInventory::default(),
             outbound,
         };
         (joining, queue)
